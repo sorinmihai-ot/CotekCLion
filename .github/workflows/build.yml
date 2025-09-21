@@ -1,0 +1,40 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  fw:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true   # keep true if qpc or others are submodules
+
+      - name: Install ARM GCC (arm-none-eabi)
+        uses: fiam/arm-none-eabi-gcc@v1
+        with:
+          release: '14.3.Rel1'  # or 'latest'
+
+      - name: Configure (CMake + Ninja)
+        run: >
+          cmake -S . -B build
+          -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi.cmake
+
+      - name: Build
+        run: cmake --build build --config Release -j 8
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: |
+            build/**/*.elf
+            build/**/*.hex
+            build/**/*.bin
+            build/**/*.map
