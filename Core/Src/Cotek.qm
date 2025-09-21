@@ -1,0 +1,474 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<model version="7.0.1" links="0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.state-machine.com/qm/qm7.xsd">
+ <framework name="qpc"/>
+ <package name="AOs" stereotype="0x02">
+  <class name="Cotek" superclass="qpc::QActive">
+   <attribute name="TimeEvt" type="QTimeEvt" visibility="0x02" properties="0x00"/>
+   <statechart properties="0x00">
+    <initial target="../1">
+     <initial_glyph conn="5,2,5,1,27,7,-2">
+      <action box="0,-2,10,2"/>
+     </initial_glyph>
+    </initial>
+    <state name="PSU_OFF">
+     <entry brief="OFF">printf(&quot;Cotek PSU is OFF\r\n&quot;);
+Scan_I2C_Bus(&amp;(hi2c1));
+cotek_set_remote_mode();
+cotek_power_off();
+HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);</entry>
+     <exit>printf(&quot;Cotek PSU is turning ON\r\n&quot;);</exit>
+     <tran trig="BUTTON_PRESSED" target="../../2">
+      <tran_glyph conn="4,21,3,1,29,16,-3">
+       <action box="0,-2,19,2"/>
+      </tran_glyph>
+     </tran>
+     <state_glyph node="4,7,26,21">
+      <entry box="0,3,10,2"/>
+      <exit box="0,5,6,2"/>
+     </state_glyph>
+    </state>
+    <state name="PSU_ON">
+     <entry brief="Turn ON the PSU and LED">printf(&quot;Cotek PSU is ON\r\n&quot;);
+Scan_I2C_Bus(&amp;hi2c1);
+cotek_set_remote_mode();
+cotek_set_output_voltage(12.50);
+cotek_set_output_current(2.75);
+cotek_commit_settings();
+cotek_power_on();
+//float voltage = cotek_read_voltage();
+//float current = cotek_read_current();
+//uint8_t temp = cotek_read_temperature();
+//printf(&quot;V = %.2f V, I = %.2f A, Temp = %d°C\r\n&quot;, voltage, current, temp);
+HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);</entry>
+     <exit>printf(&quot;Cotek PSU is turning OFF\r\n&quot;);</exit>
+     <tran trig="BUTTON_PRESSED" target="../../1">
+      <tran_glyph conn="4,53,3,1,32,-35,-6">
+       <action box="0,-2,18,2"/>
+      </tran_glyph>
+     </tran>
+     <state_glyph node="4,35,26,25">
+      <entry box="0,3,23,3"/>
+      <exit box="0,6,6,2"/>
+     </state_glyph>
+    </state>
+    <state_diagram size="75,67"/>
+   </statechart>
+  </class>
+ </package>
+ <directory name=".">
+  <file name="main.c">
+   <text>#include &quot;main.h&quot;
+
+#include &lt;string.h&gt;
+#include &quot;stdio.h&quot;
+
+#define COTEK_I2C_ADDR ((0x50) &lt;&lt; 1)  // STM32 expects 8-bit address (shifted left)
+#define TIMEOUT 100
+
+#include &quot;qpc.h&quot;  /* QP/C API */
+#include &quot;bsp.h&quot;
+#include &quot;app_signals.h&quot;
+
+void Scan_I2C_Bus(I2C_HandleTypeDef *hi2c);
+void cotek_set_remote_mode(void);
+void cotek_set_output_voltage(float voltage);
+void cotek_set_output_current(float current);
+void cotek_commit_settings(void);
+void cotek_power_on(void);
+void cotek_power_off(void);
+
+I2C_HandleTypeDef hi2c1;
+UART_HandleTypeDef huart2;
+
+
+Q_DEFINE_THIS_MODULE(&quot;main&quot;) /* this module name for Q_ASSERT() */
+
+/* The TimeBomb AO =======================================================*/
+$declare${AOs::Cotek}
+
+$define${AOs::Cotek}
+
+void Cotek_ctor(Cotek * const me) {
+    QActive_ctor(&amp;me-&gt;super, Q_STATE_CAST(&amp;Cotek_initial));
+    QTimeEvt_ctorX(&amp;me-&gt;TimeEvt, &amp;me-&gt;super, TIMEOUT_SIG, 0U);
+}
+
+static QEvt const *cotek_queue[10];
+static Cotek cotek;
+QActive *AO_Cotek = &amp;cotek.super;
+
+uint8_t tx_data[2];
+uint8_t rx_data[2];
+
+
+
+/* Private variables ---------------------------------------------------------*/
+CAN_HandleTypeDef hcan;
+
+
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_CAN_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_USART2_UART_Init(void);
+
+int __io_putchar(int ch);
+uint8_t RxBuffer[256];
+uint8_t TxBuffer[] = &quot;GREEN LED is ON \n&quot;;
+uint16_t buff_size = 0;
+volatile uint8_t rx_complete = 0;
+
+void cotek_set_remote_mode() {
+    // Write 0x80 to 0x7C (bit 7 = 1 ? Remote mode)
+    uint8_t cmd[2] = {0x7C, 0x80};
+    HAL_I2C_Master_Transmit(&amp;hi2c1, COTEK_I2C_ADDR, cmd, 2, TIMEOUT);
+}
+
+void cotek_set_output_voltage(float voltage) {
+    // Voltage * 100 -&gt; hex ? write to 0x70 (LSB), 0x71 (MSB)
+    uint16_t val = (uint16_t)(voltage * 100); // e.g. 24.25 * 100 = 2425 = 0x979
+    uint8_t cmd[3] = {0x70, val &amp; 0xFF, (val &gt;&gt; 8)};
+    HAL_I2C_Master_Transmit(&amp;hi2c1, COTEK_I2C_ADDR, cmd, 3, TIMEOUT);
+}
+
+void cotek_set_output_current(float current) {
+    // Current * 100 -&gt; hex ? write to 0x72 (LSB), 0x73 (MSB)
+    uint16_t val = (uint16_t)(current * 100); // e.g. 45.75 * 100 = 4575 = 0x11DF
+    uint8_t cmd[3] = {0x72, val &amp; 0xFF, (val &gt;&gt; 8)};
+    HAL_I2C_Master_Transmit(&amp;hi2c1, COTEK_I2C_ADDR, cmd, 3, TIMEOUT);
+}
+
+void cotek_commit_settings() {
+    // Write 0x04 to 0x7C (bit 2 = 1 ? update settings)
+    uint8_t cmd[2] = {0x7C, 0x84};  // Bit 7 still set for remote + bit 2 for update
+    HAL_I2C_Master_Transmit(&amp;hi2c1, COTEK_I2C_ADDR, cmd, 2, TIMEOUT);
+}
+
+void cotek_power_on() {
+    // Write 0x85 to 0x7C (bit 7 = 1 ? remote, bit 0 = 1 ? power ON)
+    uint8_t cmd[2] = {0x7C, 0x85};  // Bit7 = Remote, Bit0 = Power ON
+    HAL_I2C_Master_Transmit(&amp;hi2c1, COTEK_I2C_ADDR, cmd, 2, TIMEOUT);
+}
+
+void cotek_power_off(void) {
+    // Remote mode bit set (bit7 = 1), Power bit cleared (bit0 = 0) -&gt; 0x80
+    uint8_t cmd[2] = {0x7C, 0x80};
+    HAL_I2C_Master_Transmit(&amp;hi2c1, COTEK_I2C_ADDR, cmd, 2, TIMEOUT);
+}
+
+float cotek_read_voltage() {
+    uint8_t reg = 0x60;
+    HAL_I2C_Master_Transmit(&amp;hi2c1, COTEK_I2C_ADDR, &amp;reg, 1, TIMEOUT);
+    HAL_I2C_Master_Receive(&amp;hi2c1, COTEK_I2C_ADDR, rx_data, 2, TIMEOUT);
+    uint16_t raw = rx_data[1] &lt;&lt; 8 | rx_data[0];
+    return raw / 100.0f;
+}
+
+float cotek_read_current() {
+    uint8_t reg = 0x62;
+    HAL_I2C_Master_Transmit(&amp;hi2c1, COTEK_I2C_ADDR, &amp;reg, 1, TIMEOUT);
+    HAL_I2C_Master_Receive(&amp;hi2c1, COTEK_I2C_ADDR, rx_data, 2, TIMEOUT);
+    uint16_t raw = rx_data[1] &lt;&lt; 8 | rx_data[0];
+    return raw / 100.0f;
+}
+
+uint8_t cotek_read_temperature() {
+    uint8_t reg = 0x68;
+    HAL_I2C_Master_Transmit(&amp;hi2c1, COTEK_I2C_ADDR, &amp;reg, 1, TIMEOUT);
+    HAL_I2C_Master_Receive(&amp;hi2c1, COTEK_I2C_ADDR, rx_data, 1, TIMEOUT);
+    return rx_data[0];
+}
+
+void Scan_I2C_Bus(I2C_HandleTypeDef *hi2c) {
+    printf(&quot;Scanning I2C bus...\r\n&quot;);
+
+    for (uint8_t address = 1; address &lt; 127; address++) {
+        if (HAL_I2C_IsDeviceReady(hi2c, (address &lt;&lt; 1), 1, 100) == HAL_OK) {
+            printf(&quot;I2C device found at address: 0x%02X\r\n&quot;, address);
+        }
+        HAL_Delay(10);
+    }
+
+    printf(&quot;I2C scan complete.\r\n&quot;);
+}
+
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
+{
+    if (huart-&gt;Instance == USART2)
+        {
+            RxBuffer[Size] = '\0';  // Ensure null-termination
+            rx_complete = 1;
+        }
+    buff_size = Size;
+    HAL_UARTEx_ReceiveToIdle_IT(&amp;huart2, RxBuffer, 256);
+}
+
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+  /* Configure the system clock */
+  SystemClock_Config();
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_CAN_Init();
+  MX_I2C1_Init();
+  MX_USART2_UART_Init();
+
+  HAL_UARTEx_ReceiveToIdle_IT(&amp;huart2, RxBuffer, 256);
+
+  BSP_init(); /* initialize the BSP */
+    QF_init();   /* initialize QP/C */
+
+    /* create AO and start it */
+    Cotek_ctor(&amp;cotek);
+    QACTIVE_START(AO_Cotek,
+                 2U,
+                 cotek_queue,
+                 sizeof(cotek_queue)/sizeof(cotek_queue[0]),
+                 (void *)0, 0U,
+                 (void *)0);
+
+    QF_run(); /* run QP/C... */
+    return 0; /* NOTE: the scheduler does NOT return */
+
+}
+
+int __io_putchar(int ch)
+{
+    HAL_UART_Transmit(&amp;huart2, (uint8_t*)&amp;ch, 1, HAL_MAX_DELAY);
+    return ch;
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI_DIV2;
+  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL16;
+  if (HAL_RCC_OscConfig(&amp;RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&amp;RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief CAN Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_CAN_Init(void)
+{
+
+  /* USER CODE BEGIN CAN_Init 0 */
+
+  /* USER CODE END CAN_Init 0 */
+
+  /* USER CODE BEGIN CAN_Init 1 */
+
+  /* USER CODE END CAN_Init 1 */
+  hcan.Instance = CAN1;
+  hcan.Init.Prescaler = 16;
+  hcan.Init.Mode = CAN_MODE_NORMAL;
+  hcan.Init.SyncJumpWidth = CAN_SJW_1TQ;
+  hcan.Init.TimeSeg1 = CAN_BS1_4TQ;
+  hcan.Init.TimeSeg2 = CAN_BS2_2TQ;
+  hcan.Init.TimeTriggeredMode = DISABLE;
+  hcan.Init.AutoBusOff = DISABLE;
+  hcan.Init.AutoWakeUp = DISABLE;
+  hcan.Init.AutoRetransmission = DISABLE;
+  hcan.Init.ReceiveFifoLocked = DISABLE;
+  hcan.Init.TransmitFifoPriority = DISABLE;
+  if (HAL_CAN_Init(&amp;hcan) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN CAN_Init 2 */
+
+  /* USER CODE END CAN_Init 2 */
+
+}
+
+/**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.ClockSpeed = 100000;
+  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&amp;hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&amp;huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : B1_Pin(PC13) */
+  GPIO_InitStruct.Pin = B1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(B1_GPIO_Port, &amp;GPIO_InitStruct);
+
+  /*Configure GPIO pin : LD2_Pin */
+  GPIO_InitStruct.Pin = LD2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(LD2_GPIO_Port, &amp;GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  //HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
+  //HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf(&quot;Wrong parameters value: file %s on line %d\r\n&quot;, file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
+</text>
+  </file>
+ </directory>
+</model>

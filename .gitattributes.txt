@@ -1,0 +1,17 @@
+# Text normalization (good defaults)
+* text=auto eol=lf
+
+# Nextion assets & firmware binaries via Git LFS
+*.hmi filter=lfs diff=lfs merge=lfs -text
+*.tft filter=lfs diff=lfs merge=lfs -text
+
+# Firmware images / large binaries
+*.bin filter=lfs diff=lfs merge=lfs -text
+*.hex filter=lfs diff=lfs merge=lfs -text
+*.elf filter=lfs diff=lfs merge=lfs -text
+*.map filter=lfs diff=lfs merge=lfs -text
+
+# Big docs/images (optional, add/remove as you like)
+*.pdf filter=lfs diff=lfs merge=lfs -text
+*.png filter=lfs diff=lfs merge=lfs -text
+*.jpg filter=lfs diff=lfs merge=lfs -text

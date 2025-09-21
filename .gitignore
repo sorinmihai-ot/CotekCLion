@@ -1,0 +1,42 @@
+﻿# --- CLion / CMake ---
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+Testing/
+CTestTestfile.cmake
+install_manifest.txt
+_generate.stamp
+compile_commands.json
+
+# Keep our toolchain/cmake scripts
+!cmake/
+!cmake/**
+
+# IDE
+/.idea/
+/.vscode/
+
+# --- STM32 / GCC artifacts ---
+*.o
+*.obj
+*.d
+*.a
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
+*.srec
+*.su
+*.gcno
+*.gcda
+*.gcov
+*.map
+
+# Logs / temp
+*.log
+*.tmp
+
+# OS cruft
+.DS_Store
+Thumbs.db

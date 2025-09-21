@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<model version="7.0.1" links="0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.state-machine.com/qm/qm7.xsd">
+ <framework name="qpc"/>
+</model>

@@ -1,0 +1,53 @@
+# ==== CLion / CMake (build outputs & metadata)
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+Testing/
+Makefile
+*.ninja
+*.ninja_deps
+*.ninja_log
+compile_commands.json
+CMakeUserPresets.json
+CMakePresets.json
+
+# ==== STM32 / toolchain outputs
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+*.o
+*.obj
+*.d
+*.a
+
+# Linker map or intermediate logs in the root build folder CLion created
+CotekCLion.map
+
+# ==== IDE stuff
+.idea/
+.vscode/
+*.user
+*.suo
+*.swp
+
+# ==== OS junk
+.DS_Store
+Thumbs.db
+
+# ==== QP/C: keep sources, ignore build artifacts if any
+qpc/**/build/
+qpc/**/obj/
+
+# ==== Project-specific paths (keep sources, ignore local products)
+Core/Src/*.d
+Core/Src/*.o
+Drivers/**/Src/*.d
+Drivers/**/Src/*.o
+
+# If you sometimes drop test firmware or assets in Core/ or Drivers/, ignore them:
+Core/**/*.bin
+Core/**/*.hex
+Drivers/**/*.bin
+Drivers/**/*.hex

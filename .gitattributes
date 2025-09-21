@@ -1,0 +1,32 @@
+﻿# Normalize text files to LF in repo; Windows editors will handle CRLF locally
+* text=auto eol=lf
+
+# Scripts that prefer CRLF on Windows
+*.bat eol=crlf
+*.cmd eol=crlf
+*.ps1 eol=crlf
+
+# STM32/embedded sources and scripts
+*.c   text eol=lf
+*.h   text eol=lf
+*.cpp text eol=lf
+*.hpp text eol=lf
+*.s   text eol=lf
+*.ld  text eol=lf
+*.ioc text eol=lf
+CMakeLists.txt text eol=lf
+*.cmake text eol=lf
+
+# Binary artifacts (no diffs)
+*.elf -text diff=none
+*.bin -text diff=none
+*.hex -text diff=none
+*.a   -text diff=none
+
+# Assets
+*.png -text
+*.jpg -text
+*.jpeg -text
+*.gif -text
+*.zip -text
+*.pdf -text
