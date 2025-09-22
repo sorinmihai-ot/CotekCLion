@@ -1,42 +1,64 @@
-﻿# --- CLion / CMake ---
+﻿# ---- CLion / CMake build dirs (local) ----
+# CLion uses cmake-build-* by default; keep them out of git
 cmake-build-*/
+build/
+out/
+.cache/
+.idea/
+
+# Ninja/CMake byproducts
 CMakeFiles/
 CMakeCache.txt
+CMakeScripts/
 Testing/
 CTestTestfile.cmake
 install_manifest.txt
-_generate.stamp
 compile_commands.json
+Makefile
+cmake_install.cmake
 
-# Keep our toolchain/cmake scripts
-!cmake/
-!cmake/**
-
-# IDE
-/.idea/
-/.vscode/
-
-# --- STM32 / GCC artifacts ---
-*.o
-*.obj
-*.d
-*.a
+# Toolchain/firmware outputs
 *.elf
 *.hex
 *.bin
 *.map
 *.lst
-*.srec
-*.su
-*.gcno
-*.gcda
-*.gcov
-*.map
+*.axf
 
-# Logs / temp
+# Intermediate objects / deps
+*.o
+*.obj
+*.d
+*.a
+*.lib
+
+# STM32Cube / MCU config cruft (if any appear later)
+*.launch
+*.uvopt*
+*.uvprojx
+*.ew*
+*.ioc
+
+# Logs / traces
 *.log
-*.tmp
+*.trace
+*.ses
+*.jlink
+*.svd
 
-# OS cruft
+# OS / editor stuff
 .DS_Store
 Thumbs.db
+*.swp
+*.swo
+*.tmp
+
+# Nextion Editor temp export (if you export HMI binaries here)
+*.tft
+
+# VSCode (if you try it later)
+.vscode/
+
+# Python virtual envs (rare, but safe)
+.venv/
+venv/
