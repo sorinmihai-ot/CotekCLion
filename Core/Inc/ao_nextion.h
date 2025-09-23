@@ -8,11 +8,11 @@
 extern "C" {
 #endif
 
-    extern QActive *const AO_Nextion;
-    void NextionAO_ctor(void);
+extern QActive *const AO_Nextion;
+void NextionAO_ctor(void);
 
-    /* Call this from HAL_UARTEx_RxEventCallback(huart2) */
-    void Nextion_OnRx(const uint8_t *buf, uint16_t len);
+// Nextion RX hook called from HAL_UARTEx_RxEventCallback()
+void Nextion_OnRx(uint8_t const *buf, uint16_t len);
 
 #ifdef __cplusplus
 }

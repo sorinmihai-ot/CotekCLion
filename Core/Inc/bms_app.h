@@ -20,6 +20,10 @@ extern "C" {
     /* helpers (also handy for tests) */
     int  BMS_ParseFrame(const CanFrameEvt *f, BmsTelemetry *bms);
     void BMS_GetSnapshot(BmsTelemetry *dst);
+    // ---- BMS sim/telemetry publish helper ------------------------------
+    // Posts one complete BmsTelemetry sample to the Controller AO.
+    void BMS_publish_telemetry(BmsTelemetry const *t);
+
 
 #ifdef __cplusplus
 }

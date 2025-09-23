@@ -14,7 +14,7 @@
 #include "stm32f1xx_hal_gpio.h"
 #include "stm32f1xx_hal_i2c.h"
 #include "main.h"
-
+#include <math.h>
 
 Q_DEFINE_THIS_FILE
 
@@ -37,11 +37,37 @@ static float cotek_read_voltage(void);
 static float cotek_read_current(void);
 static float cotek_read_temperature(void);
 
+
 typedef struct {
     QActive super;
     uint8_t on;
     float   vset, iset;
+    // --- presence monitor ---
+    QTimeEvt tick;        // 200 ms tick
+    uint32_t alive_ms;    // ms since last valid reply
+    // last known status (what we publish)
+    uint8_t present;
+    uint8_t out_on;
+    float   v_out, i_out, t_out;
 } CotekAO;
+
+//helper to send the Cotek data to the HMI screen
+static void post_psu(const CotekAO *me,
+                     uint8_t present, uint8_t output_on,
+                     float v_out, float i_out, float temp_C)
+{
+    (void)me;
+    NextionPsuEvt *pe = Q_NEW(NextionPsuEvt, NEX_REQ_UPDATE_PSU_SIG);
+    pe->present   = present;
+    pe->output_on = output_on;
+    pe->v_out     = v_out;
+    pe->i_out     = i_out;
+    pe->temp_C    = temp_C;
+    if (!QACTIVE_POST_X(AO_Nextion, &pe->super, 1U, &me->super)) {
+        QF_gc(&pe->super);
+    }
+}
+
 
 static QState Cotek_initial(CotekAO *me, void const *par);
 static QState Cotek_active (CotekAO *me, QEvt const *e);
@@ -58,11 +84,64 @@ static QState Cotek_initial(CotekAO * const me, void const *par) {
     cotek_set_remote_mode();
     cotek_power_off();
     me->on = 0U; me->vset = 0.f; me->iset = 0.f;
+    QTimeEvt_ctorX(&me->tick, &me->super, COTEK_TICK_SIG, 0U);
+    // start periodic every 200ms
+    QTimeEvt_armX(&me->tick, 50U, 50U); // assuming 1 tick = 10 ms (adjust to your BSP tick)
+    me->alive_ms = 1000U;   // start as stale
+    me->present = 0U;
+    me->out_on  = 0U;
+    me->v_out = me->i_out = me->t_out = 0.0f;
     return Q_TRAN(&Cotek_active);
 }
 
 static QState Cotek_active(CotekAO * const me, QEvt const * const e) {
     switch (e->sig) {
+    case COTEK_TICK_SIG: {
+            float v = cotek_read_voltage();      // your existing function
+            float i = cotek_read_current();      // your existing function
+            float t = cotek_read_temperature();  // your existing function
+            // non-blocking poll: start/advance one small read each tick
+            // e.g., issue one command here; return immediately
+            // If reads succeeded, consider the PSU "alive".
+            // (If you can detect I2C error, gate this with that.)
+            me->alive_ms = 0U;
+
+            // Update last-known readings (for UI)
+            me->v_out = v;
+            me->i_out = i;
+            me->t_out = t;
+
+            // For now, infer output ON/OFF from your AO state (or wire to real status if you have it)
+            me->out_on = (me->on != 0U);
+
+            // ---- 2) age the "alive" timer & compute presence ----
+            // Tick period ~200ms; cap at a few seconds
+            if (me->alive_ms < 5000U) {
+                me->alive_ms += 200U;
+            }
+            uint8_t new_present = (me->alive_ms <= 1000U) ? 1U : 0U;
+
+            // ---- 3) publish only if something visible changed ----
+            static uint8_t last_present = 0xFFU;  // force first publish
+            static uint8_t last_out_on;
+            static float last_v, last_i, last_t;
+
+            if (new_present != last_present ||
+                me->out_on   != last_out_on  ||
+                fabsf(me->v_out - last_v) > 0.05f ||
+                fabsf(me->i_out - last_i) > 0.05f ||
+                fabsf(me->t_out - last_t) > 0.5f)
+            {
+                last_present = new_present;
+                last_out_on  = me->out_on;
+                last_v = me->v_out;
+                last_i = me->i_out;
+                last_t = me->t_out;
+
+                post_psu(me, new_present, me->out_on, me->v_out, me->i_out, me->t_out);
+            }
+            return Q_HANDLED();
+    }
         case PSU_REQ_SETPOINT_SIG: {
             PsuSetEvt const *se = Q_EVT_CAST(PsuSetEvt);
             me->vset = se->voltSet; me->iset = se->currSet; me->on = 1U;

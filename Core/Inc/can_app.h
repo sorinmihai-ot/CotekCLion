@@ -11,6 +11,10 @@
 #include "qpc.h"
 #include <stdint.h>
 
+#ifdef ENABLE_BMS_SIM
+void BmsSim_tick(void);
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif

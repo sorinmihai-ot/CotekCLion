@@ -52,7 +52,7 @@
 #include "stm32f1xx_hal_i2c.h"
 
 //Firmware Version
-const char FW_VERSION_STR[] = "0.3.1";
+const char FW_VERSION_STR[] = "0.4.0";
 static uint8_t nexRx[128];
 /* HMI RX buffer (visible to main and callbacks) */
 uint8_t s_uart3_rxbuf[128];
@@ -63,6 +63,18 @@ Q_DEFINE_THIS_MODULE("main") /* this module name for Q_ASSERT() */
 
 #define COTEK_I2C_ADDR ((0x50) << 1)  // STM32 expects 8-bit address (shifted left)
 #define I2C_TIMEOUT_MS 100
+// 1) Pick a larger block size for UI events. 320 is a safe start.
+#define UI_POOL_BLOCK_SIZE   320U
+#define UI_POOL_BLOCKS       16u
+
+typedef struct {
+  uint8_t bytes[(sizeof(NextionSummaryEvt) > sizeof(NextionDetailsEvt))
+                  ? sizeof(NextionSummaryEvt)
+                  : sizeof(NextionDetailsEvt)];
+} UiPoolMax;
+
+_Static_assert(sizeof(NextionSummaryEvt) <= UI_POOL_BLOCK_SIZE, "UI pool too small for NextionSummaryEvt");
+_Static_assert(sizeof(NextionDetailsEvt) <= UI_POOL_BLOCK_SIZE, "UI pool too small for NextionDetailsEvt");
 
 /* Private variables ---------------------------------------------------------*/
 CAN_HandleTypeDef hcan;
@@ -79,29 +91,10 @@ static void MX_I2C1_Init(void);
 static void MX_CAN_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_USART3_UART_Init(void);
+// 2) Make the storage big enough. If you currently have 8 blocks, keep it.
+static uint8_t s_uiPoolSto[UI_POOL_BLOCK_SIZE * UI_POOL_BLOCKS];
 
 extern QActive *AO_Cotek;
-
-// static void nex_send_blocking(const char *fmt, ...) {
-//   extern UART_HandleTypeDef huart3;
-//   uint8_t tmp[160];
-//   char    buf[128];
-//
-//   va_list ap; va_start(ap, fmt);
-//   int n = vsnprintf(buf, sizeof(buf) - 1, fmt, ap);
-//   va_end(ap);
-//   if (n < 0) return;
-//   if ((size_t)n >= sizeof(buf)) { buf[sizeof(buf) - 1] = '\0'; n = (int)strlen(buf); }
-//
-//   size_t len = (size_t)n;
-//   if (len > sizeof(tmp) - 3U) len = sizeof(tmp) - 3U;
-//   memcpy(tmp, buf, len);
-//   tmp[len + 0U] = 0xFF;
-//   tmp[len + 1U] = 0xFF;
-//   tmp[len + 2U] = 0xFF;
-//
-//   (void)HAL_UART_Transmit(&huart3, tmp, (uint16_t)(len + 3U), 100); // 100ms timeout
-// }
 
 void Scan_I2C_Bus(I2C_HandleTypeDef *hi2c) {
     printf("Scanning I2C bus...\r\n");
@@ -133,16 +126,23 @@ void StartHmiRx(void) {
 }
 
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t len) {
+  extern void Nextion_OnRx(uint8_t const *buf, uint16_t len);
   /* Gate everything until QF is live */
   if (!BSP_qfStarted()) {
-    if (huart == &huart3) HAL_UARTEx_ReceiveToIdle_IT(&huart3, s_uart3_rxbuf, sizeof s_uart3_rxbuf);
-    else if (huart == &huart2) HAL_UARTEx_ReceiveToIdle_IT(&huart2, s_uart2_rxbuf, sizeof s_uart2_rxbuf);
+    if (huart == &huart3 && len > 0U)
+    {
+      Nextion_OnRx(s_uart3_rxbuf, len);               // <-- use s_uart3_rxbuf
+      HAL_UARTEx_ReceiveToIdle_IT(&huart3, s_uart3_rxbuf, sizeof s_uart3_rxbuf);
+    }
+
+    else if (huart == &huart2 && len > 0U) HAL_UARTEx_ReceiveToIdle_IT(&huart2, s_uart2_rxbuf, sizeof s_uart2_rxbuf);
     return;
   }
   // post-QF: (for now) just re-arm, you’re not parsing HMI replies yet
-  if (huart == &huart3) {
+  if (huart == &huart3 && len > 0U) {
+    Nextion_OnRx(s_uart3_rxbuf, len);               // <-- use s_uart3_rxbuf
     HAL_UARTEx_ReceiveToIdle_IT(&huart3, s_uart3_rxbuf, sizeof s_uart3_rxbuf);
-  } else if (huart == &huart2) {
+  } else if (huart == &huart2 && len > 0U) {
     HAL_UARTEx_ReceiveToIdle_IT(&huart2, s_uart2_rxbuf, sizeof s_uart2_rxbuf);
   }
 }
@@ -195,6 +195,7 @@ int main(void)
   printf("main(): UART3 up\r\n");
   //HAL_UARTEx_ReceiveToIdle_IT(&huart3, nexRx, sizeof(nexRx));
   MX_CAN_Init();
+  CANAPP_InitAll();
   printf("main() 1\r\n");
   uint32_t prigroup = (SCB->AIRCR >> SCB_AIRCR_PRIGROUP_Pos) & 7U;
   printf("PRIGROUP=%lu\r\n", (unsigned long)prigroup);
@@ -204,16 +205,8 @@ int main(void)
     /* ---------------- dynamic event pools & pub/sub table --------------------*/
   static QF_MPOOL_EL(CanFrameEvt)     s_canPoolSto[64];
   static QF_MPOOL_EL(BmsTelemetryEvt) s_bmsPoolSto[32];
-    /* NEW: UI pool for NextionSummaryEvt (big struct ~200+ bytes).
-   8 blocks is usually plenty; tune as needed. */
-  static QF_MPOOL_EL(NextionSummaryEvt) uiPoolSto[8];
   static QSubscrList subscrSto[MAX_PUB_SIG];
   QF_psInit(subscrSto, Q_DIM(subscrSto));
-    /* helpful print to see sizes on UART */
-  printf("pool blocks: CAN=%u  BMS=%u  UI=%u\r\n",
-       (unsigned)sizeof(s_canPoolSto[0]),
-       (unsigned)sizeof(s_bmsPoolSto[0]),
-       (unsigned)sizeof(uiPoolSto[0]));
     /* pools: smallest blocks first */
     /* initialize pools in ascending size */
   if (sizeof(s_canPoolSto[0]) <= sizeof(s_bmsPoolSto[0])) {
@@ -224,24 +217,16 @@ int main(void)
         QF_poolInit(s_canPoolSto, sizeof(s_canPoolSto), sizeof(s_canPoolSto[0]));
   }
     /* UI pool is the largest: init it last */
-  QF_poolInit(uiPoolSto, sizeof(uiPoolSto), sizeof(uiPoolSto[0]));
-  HAL_Delay(50);
-
-  nex_send3("rest");          // 1) hard reset panel
-  HAL_Delay(500);            //    allow full reboot (many panels need >1s)
-
-  nex_send3("bkcmd=3");       // 2) verbose replies (helps later if you read RX)
-  HAL_Delay(20);
-
-  nex_send3("page pSplash");  // 3) guarantee we’re on splash
-  HAL_Delay(200);             //    give the page time to load
-
-  /* 4) finally write the version line */
+  QF_poolInit(s_uiPoolSto, sizeof(s_uiPoolSto), UI_POOL_BLOCK_SIZE);
+  printf("pool blocks: CAN=%lu  BMS=%lu  UI=%u\r\n",
+       (unsigned long)(sizeof(s_canPoolSto) / sizeof(s_canPoolSto[0])),
+       (unsigned long)(sizeof(s_bmsPoolSto) / sizeof(s_bmsPoolSto[0])),
+       UI_POOL_BLOCK_SIZE);
   // char verCmd[64];
   // snprintf(verCmd, sizeof verCmd, "pSplash.tVer.txt=\"FW v%s\"", FW_VERSION_STR);
   // nex_send3(verCmd);
-  nex_send3("tVer.txt=\"FW v0.3.1\"");
-  HAL_Delay(50);
+  //nex_send3("tVer.txt=\"FW v0.3.1\"");
+
   printf("main() 3\r\n");
   static int const qfAwarePri_compiled = QF_AWARE_ISR_CMSIS_PRI;
   printf("QP compiled aware PRI = %d\r\n", qfAwarePri_compiled);
@@ -261,11 +246,11 @@ int main(void)
   QACTIVE_START(AO_Controller, 4U, ctlQueueSto, Q_DIM(ctlQueueSto), 0, 0U, 0);
   printf("main() CtlAO up\r\n");
   // 2) Nextion second
-  static QEvt const *nexQueueSto[32];
-  QACTIVE_START(AO_Nextion, 1U, nexQueueSto, Q_DIM(nexQueueSto), 0, 0U, 0);
+  static QEvt const *nexQueueSto[128];
+  QACTIVE_START(AO_Nextion, 5U, nexQueueSto, Q_DIM(nexQueueSto), 0, 0U, 0);
   printf("main() NexAO up\r\n");
   // 3) Cotek
-  static QEvt const *cotekQueueSto[16];
+  static QEvt const *cotekQueueSto[64];
   QACTIVE_START(AO_Cotek, 2U, cotekQueueSto, Q_DIM(cotekQueueSto), 0, 0U, 0);
   printf("main() CotekAO up\r\n");
   // 4) BMS
@@ -274,7 +259,7 @@ int main(void)
   printf("main() BmsAO up\r\n");
   /* Bring up CAN after AOs are running */
   static QEvt const bootEvt = QEVT_INITIALIZER(BOOT_SIG);
-  (void)QACTIVE_POST_X(AO_Controller, &bootEvt, 0U, 0U);
+  (void)QACTIVE_POST_X(AO_Controller, &bootEvt, 1U, 0U);
   // clear any stale pending EXTI before enabling
   __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_13);
   NVIC_ClearPendingIRQ(EXTI15_10_IRQn);
@@ -284,6 +269,16 @@ int main(void)
   HAL_UARTEx_ReceiveToIdle_IT(&huart2, RxBuffer, 256);
   printf("main() 8\r\n");
   __set_BASEPRI(0U);
+  HAL_Delay(50);
+  nex_send3("bkcmd=3");             HAL_Delay(20);
+  nex_send3("rest");                HAL_Delay(1100);  // give HMI time to reboot
+  nex_send3("page pSplash");        HAL_Delay(50);
+  nex_send3("pSplash.tVer.txt=\"FW v0.3.1\"");
+  //nex_send3("ref pSplash.tVer");
+  HAL_Delay(3000);
+  printf("sizeof(NextionSummaryEvt)=%u  Details=%u\r\n",
+       (unsigned)sizeof(NextionSummaryEvt),
+       (unsigned)sizeof(NextionDetailsEvt));
   printf("QP compiled aware PRI = %d\r\n", qfAwarePri_compiled);
   return QF_run();   /* does not return */
 }
@@ -361,7 +356,7 @@ static void MX_CAN_Init(void)
 {
   hcan.Instance = CAN1;
   hcan.Init.Prescaler = 4;
-  hcan.Init.Mode = CAN_MODE_NORMAL;
+  hcan.Init.Mode = CAN_MODE_LOOPBACK;  /////revert to normal when a battery is connected
   hcan.Init.SyncJumpWidth = CAN_SJW_1TQ;
   hcan.Init.TimeSeg1 = CAN_BS1_13TQ;
   hcan.Init.TimeSeg2 = CAN_BS2_2TQ;

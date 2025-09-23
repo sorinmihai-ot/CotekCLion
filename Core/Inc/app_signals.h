@@ -8,6 +8,7 @@
 #include <stdbool.h>
 #include "qpc.h"
 
+
 /* Signals (publishable first; order matters for MAX_PUB_SIG) */
 enum AppSignals {
     /* ====== PUBLISHED signals (must be < MAX_PUB_SIG) ====== */
@@ -21,18 +22,26 @@ enum AppSignals {
     /* ====== NOT published (direct posts / time events) ====== */
     TIMEOUT_SIG , /* used by QTimeEvt; not published           */
     BMS_TICK_SIG,              /* internal periodic tick for BMS            */
-
+#ifdef ENABLE_BMS_SIM
+    SIM_TICK_SIG,          /* private periodic tick for the in-firmware BMS simulator */
+#endif
     MAX_PUB_SIG,               // sentinel for QF_psInit only
     /* HMI <-> Controller (direct posts) */
     BOOT_SIG = MAX_PUB_SIG + 1,
     NEX_READY_SIG,             /* Nextion AO -> Controller                   */
     NEX_REQ_SHOW_PAGE_SIG,     /* Controller -> Nextion                      */
-    NEX_REQ_UPDATE_SUMMARY_SIG,/* Controller -> Nextion                      */
+    NEX_REQ_UPDATE_SUMMARY_SIG,/* Controller -> Nextion*/
+    NEX_REQ_UPDATE_LIVE_SIG,
+    NEX_REQ_UPDATE_DETAILS_SIG,
+    NEX_REQ_UPDATE_PSU_SIG,
 
     /* PSU control/status (direct posts) */
     PSU_REQ_SETPOINT_SIG,      /* Controller -> Cotek                        */
     PSU_REQ_OFF_SIG,           /* Controller -> Cotek                        */
-    PSU_RSP_STATUS_SIG,        /* Cotek -> Controller                        */
+    PSU_RSP_STATUS_SIG,        /* Cotek -> Controller  */
+    // ---- Cotek status broadcast (AO_Cotek -> AO_Controller) ----
+    COTEK_STATUS_SIG,     // carries PSU presence, out state, and latest readings
+    COTEK_TICK_SIG,
 
     /* Board button (direct posts) */
     BUTTON_PRESSED_SIG,
@@ -98,6 +107,23 @@ typedef struct {
     uint16_t statusWord;
     uint16_t faultWord;
 } PsuStatusEvt;
+// posted by AO_Cotek whenever its view of the PSU changes or on periodic refresh
+typedef struct {
+    QEvt super;
+    uint8_t present;     // 1 = PSU detected, 0 = missing
+    uint8_t out_on;      // 1 = output ON, 0 = OFF/unknown
+    float   v_out;       // PSU output voltage (V), if available
+    float   i_out;       // PSU output current (A), if available
+    float   t_out;       // PSU temperature (°C), if available
+} CotekStatusEvt;
+typedef struct {
+    QEvt super;
+    uint8_t present;     /* 1/0 */
+    uint8_t output_on;   /* 1/0 */
+    float   v_out;       /* V */
+    float   i_out;       /* A */
+    float   temp_C;      /* degC (if you have it; else fill NAN) */
+} NextionPsuEvt;
 
 /* Nextion: change page */
 typedef struct {
@@ -108,17 +134,78 @@ typedef struct {
 /* Nextion: summary payload for pMain */
 typedef struct {
     QEvt super;
-    char      battTypeStr[24];
-    uint16_t  typeColor565;
-    float     packV;
-    char      statusStr[20];
-    uint16_t  statusColor565;
-    char      errors[64];
-    bool      warnIcon;
-    bool      recoverable;
+    // Summary values for pMain
+    char      battTypeStr[12];     // "400s","500s","600s","Unknown"
+    uint16_t  typeColor565;        // 2016 / 65504 / 1023 / 63488
+    float     packV;               // from BmsTelemetry.array_voltage_V
+
+    char      statusStr[24];       // from bms_state_str(bms_state)
+    uint16_t  statusColor565;      // optional (set 0 if you don’t use a color on HMI)
+
+    char      errors[48];          // short combined error summary or "" if none
+    uint8_t   warnIcon;            // show “warning” icon? 0/1
+    uint8_t   recoverable;         // show “recoverable” icon? 0/1
+    uint8_t   charging;            // show “charging” group? 0/1
+
+    // ---- PSU (Cotek) summary for pMain ----
+    uint8_t psu_present;   // 1/0
+    uint8_t psu_out_on;    // 1/0
+    float   psu_v;         // volts
+    float   psu_i;         // amps
+    float   psu_t;         // degC
+
+    // Optional “reason” breadcrumb you print to UART only
     char      reason[96];
-    bool      charging;       /* NEW: show “charging” banner */
 } NextionSummaryEvt;
+// ----- details shown on pDetails -----
+typedef struct {
+    QEvt super;
+
+    // Details page (pDetails) – names mirror your labels
+    float high_voltage_V;
+    float low_voltage_V;
+    float avg_voltage_V;
+
+    float high_temp_C;
+    float low_temp_C;
+    float pack_high_temp_C;
+    float pack_low_temp_C;
+
+    char  serial_number[24];
+    char  firmware[16];
+
+    uint16_t fan_speed_rpm;
+
+    uint8_t soc_percent;
+    uint8_t soc2_percent;
+
+    char  bms_state_str[24];   // text for current state
+    char  bms_fault_str[48];   // combined faults text
+} NextionDetailsEvt;
+
+typedef struct {
+    QEvt super;
+    // BMS
+    float packV;          // V
+    float packA;          // A (positive=discharge, negative=charge) or as you prefer
+    uint8_t soc;          // %
+    int16_t tempC;        // main temp (or average)
+    uint8_t bms_present;  // 1=present, 0=lost/stale
+    // --- BMS details (pDetails) ---
+    float   vMinCell;       // V
+    float   vMaxCell;       // V
+    float   vDeltaCell;     // V (max-min)
+    int16_t tMinC;          // °C
+    int16_t tMaxC;          // °C
+    uint16_t cycles;        // charge cycles
+    uint32_t faultsMask;    // your bitfield, if you have one
+    // COTEK
+    uint8_t cotek_present;  // 1=psu detected
+    uint8_t cotek_out_on;   // 1=output enabled
+    float cotek_V;          // V (readback)
+    float cotek_I;          // A (readback)
+    int16_t cotek_T;        // C (optional)
+} NextionLiveEvt;
 
 /* compile-time sanity */
 Q_ASSERT_COMPILE(sizeof(CanFrameEvt)     >= sizeof(QEvt));

@@ -102,6 +102,7 @@ target_compile_definitions(CotekCLion.elf PRIVATE
         USE_HAL_DRIVER
         STM32F103xB
         QF_BASEPRI=0x50  # 0x50 >> (8-4) = 5
+        ENABLE_BMS_SIM
         $<$<CONFIG:Debug>:DEBUG>
 )
 
