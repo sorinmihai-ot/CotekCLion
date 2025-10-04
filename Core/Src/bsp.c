@@ -13,7 +13,7 @@
 #include "stm32f1xx.h"
 
 // Local-scope defines -----------------------------------------------------
-#define TICK_INT_PRIORITY 5
+// #define TICK_INT_PRIORITY 5
 // LED pins available on the board (just one user LED LD2--Green on PA.5)
 #define LD2_PIN  5U
 
@@ -53,34 +53,39 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
         __HAL_GPIO_EXTI_CLEAR_IT(GPIO_Pin); // clear any spurious pending
         return;
     }
-    if (GPIO_Pin == USER_BTN_PIN) {
-        GPIO_PinState s = HAL_GPIO_ReadPin(USER_BTN_PORT, USER_BTN_PIN);
-        if (s == GPIO_PIN_SET) {
-            static QEvt const pressEvt = { .sig = BUTTON_PRESSED_SIG };
-            g_lastSig = BUTTON_PRESSED_SIG;  g_lastTag = 3;
-            (void)QACTIVE_POST_X(AO_Controller, &pressEvt, 3U, 0U);
-        } else {
-            static QEvt const relEvt   = { .sig = BUTTON_RELEASED_SIG };
-            g_lastSig = BUTTON_RELEASED_SIG; g_lastTag = 4;
-            (void)QACTIVE_POST_X(AO_Controller, &relEvt, 3U, 0U);
-        }
+    if (GPIO_Pin == GPIO_PIN_13) {
+        __HAL_GPIO_EXTI_CLEAR_IT(GPIO_Pin);
+        // GPIO_PinState s = HAL_GPIO_ReadPin(USER_BTN_PORT, USER_BTN_PIN);
+        // if (s == GPIO_PIN_SET) {
+        //     static QEvt const pressEvt = { .sig = BUTTON_PRESSED_SIG };
+        //     g_lastSig = BUTTON_PRESSED_SIG;  g_lastTag = 3;
+        //     printf("BTN: EXTI PC13 pressed\r\n");
+        //     (void)QACTIVE_POST_X(AO_Controller, &pressEvt, 3U, 0U);
+        //
+        // } else {
+        //     static QEvt const relEvt   = { .sig = BUTTON_RELEASED_SIG };
+        //     g_lastSig = BUTTON_RELEASED_SIG; g_lastTag = 4;
+        //     printf("BTN: EXTI PC13 pressed again\r\n");
+        //     (void)QACTIVE_POST_X(AO_Controller, &relEvt, 3U, 0U);
+        // }
+        return;
     }
 }
-// ------------ LED on PC13 (change if needed) ------------
+// ------------ LED on PA5 (change if needed) ------------
 static void led_init_once(void) {
     static uint8_t inited = 0;
     if (inited) return;
-    __HAL_RCC_GPIOC_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
     GPIO_InitTypeDef g = {0};
-    g.Pin   = GPIO_PIN_13;
+    g.Pin   = GPIO_PIN_5;
     g.Mode  = GPIO_MODE_OUTPUT_PP;
     g.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(GPIOC, &g);
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET); // LED off on many boards
+    HAL_GPIO_Init(GPIOA, &g);
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET); // LED off on many boards
     inited = 1;
 }
 static inline void led_toggle(void) {
-    GPIOC->ODR ^= GPIO_PIN_13;
+    GPIOA->ODR ^= GPIO_PIN_5;
 }
 // ------------ UART2 ready flag ------------
 static volatile uint8_t s_uart2_ready = 0;
@@ -231,7 +236,11 @@ void SysTick_Handler(void) {
 
     if (s_qf_started) {
         /* QP time events */
-        QTIMEEVT_TICK_X(0U, &l_SysTick_Handler);
+        static uint8_t q_tick_div;
+        if (++q_tick_div >= 10) {   // 1000 Hz / 10 = 100 Hz
+            q_tick_div = 0;
+            QTIMEEVT_TICK_X(0U, &l_SysTick_Handler);
+            }
 
         /* Button debounce + posts ONLY after kernel started */
         static struct {
@@ -239,7 +248,7 @@ void SysTick_Handler(void) {
             uint32_t previous;
         } buttons = { 0U, 0U };
 
-        uint32_t current = ~GPIOC->IDR;
+        uint32_t current = GPIOC->IDR;
         uint32_t tmp = buttons.depressed;
         buttons.depressed |= (buttons.previous & current);
         buttons.depressed &= (buttons.previous | current);
@@ -252,11 +261,12 @@ void SysTick_Handler(void) {
             if ((current & (1U << B1_PIN)) != 0U) {
                 static QEvt const pressEvt = QEVT_INITIALIZER(BUTTON_PRESSED_SIG);
                 g_lastSig = BUTTON_PRESSED_SIG;  g_lastTag = 1;  // tag 1 = SysTick press
-                QACTIVE_POST_X(AO_Cotek, &pressEvt, 3U, 0U);
+                QACTIVE_POST_X(AO_Controller, &pressEvt, 3U, 0U);
+                printf("BTN: PC13 pressed\r\n");
             } else {
                 static QEvt const releaseEvt = QEVT_INITIALIZER(BUTTON_RELEASED_SIG);
                 g_lastSig = BUTTON_RELEASED_SIG; g_lastTag = 2; // tag 2 = SysTick release
-                QACTIVE_POST_X(AO_Cotek, &releaseEvt, 3U, 0U);
+                QACTIVE_POST_X(AO_Controller, &releaseEvt, 3U, 0U);
             }
         }
     }

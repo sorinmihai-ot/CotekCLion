@@ -60,28 +60,30 @@ void BmsSim_tick(void) {
 
     // Prepare a synthetic telemetry packet
     BmsTelemetry t = {0};
-
+    // --- identity / type ---
+    t.battery_type_code = 0x0500u;          // 500s
     // Voltage: 51.5 .. 52.5 V slow sine
     t.array_voltage_V = 52.0f + 0.5f * sinf(phase);
 
-    // SoC: bounce between ~55..85%
-    uint8_t soc = (uint8_t)(70.0f + 15.0f * sinf(phase * 0.35f));
-    if (soc > 100U) soc = 100U;
-    t.soc_percent = soc;
+    // --- electricals ---
+    t.array_voltage_V = 41.0f;              // Pack V shown on pMain
+    t.high_cell_V     = 4.10f;              // pDetails High
+    t.low_cell_V      = 3.95f;              // pDetails Low
+    t.current_dA      = 0;                  // 0.0 A (deci-amps)
+    // --- temperatures ---
+    t.sys_temp_high_C = 32.0f;
+    t.sys_temp_low_C  = 32.0f;
+    // --- status / health ---
+    t.bms_state = 0u;                        // 0 = Idle (see ao_controller mapping)
+    t.bms_fault = 0u;                        // no faults
+    t.soc_percent = 80u;                     // any steady SoC
+    t.fan_rpm = 0u;                          // fan stopped
+    t.last_error_class = 0u;
+    t.last_error_code  = 0u;
 
-    // Battery type cycling through your known codes (400s/500s/600s)
-    // Pick one and keep it stable; or rotate every few seconds:
-    static uint8_t sel = 0U;
-    if (((int)(phase * 10.0f)) % 50 == 0) { // very slow rotate
-        sel = (uint8_t)((sel + 1U) % 3U);
-    }
-    t.battery_type_code = (sel == 0U) ? 0x0400U
-                        : (sel == 1U) ? 0x0500U
-                                      : 0x0600U;
-
-    // BMS state and faults: normal / no faults
-    t.bms_state = 2U;        // pick a value that your UI maps to "OK/Run"
-    t.bms_fault = 1U;
+    // --- identifiers (shown in pDetails) ---
+    t.serial_number     = 12345678u;         // any fixed number
+    t.firmware_version  = 401u;              // matches your "0.4.1" feel, but numeric
 
     // Publish just like a real CAN decode would
     BMS_publish_telemetry(&t);
