@@ -21,6 +21,8 @@ enum AppSignals {
 
     /* ====== NOT published (direct posts / time events) ====== */
     TIMEOUT_SIG , /* used by QTimeEvt; not published           */
+    CHARGE_TIMEOUT_SIG,      // <-- new: 30s charge window elapsed
+    PSU_OFF_WAIT_TO_SIG,     // internal: watchdog while we wait for OFF confirmation
     BMS_TICK_SIG,              /* internal periodic tick for BMS            */
 #ifdef ENABLE_BMS_SIM
     SIM_TICK_SIG,          /* private periodic tick for the in-firmware BMS simulator */

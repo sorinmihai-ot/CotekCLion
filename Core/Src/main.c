@@ -52,7 +52,7 @@
 #include "stm32f1xx_hal_i2c.h"
 
 //Firmware Version
-const char FW_VERSION_STR[] = "0.4.0";
+const char FW_VERSION_STR[] = "0.4.1";
 static uint8_t nexRx[128];
 /* HMI RX buffer (visible to main and callbacks) */
 uint8_t s_uart3_rxbuf[128];
@@ -222,10 +222,6 @@ int main(void)
        (unsigned long)(sizeof(s_canPoolSto) / sizeof(s_canPoolSto[0])),
        (unsigned long)(sizeof(s_bmsPoolSto) / sizeof(s_bmsPoolSto[0])),
        UI_POOL_BLOCK_SIZE);
-  // char verCmd[64];
-  // snprintf(verCmd, sizeof verCmd, "pSplash.tVer.txt=\"FW v%s\"", FW_VERSION_STR);
-  // nex_send3(verCmd);
-  //nex_send3("tVer.txt=\"FW v0.3.1\"");
 
   printf("main() 3\r\n");
   static int const qfAwarePri_compiled = QF_AWARE_ISR_CMSIS_PRI;
@@ -273,8 +269,11 @@ int main(void)
   nex_send3("bkcmd=3");             HAL_Delay(20);
   nex_send3("rest");                HAL_Delay(1100);  // give HMI time to reboot
   nex_send3("page pSplash");        HAL_Delay(50);
-  nex_send3("pSplash.tVer.txt=\"FW v0.3.1\"");
-  //nex_send3("ref pSplash.tVer");
+  char verCmd[64];
+  snprintf(verCmd, sizeof verCmd, "pSplash.tVer.txt=\"FW v%s\"", FW_VERSION_STR);
+  nex_send3(verCmd);
+  //nex_send3("pSplash.tVer.txt=\"FW v0.3.1\"");
+  nex_send3("ref pSplash.tVer");
   HAL_Delay(3000);
   printf("sizeof(NextionSummaryEvt)=%u  Details=%u\r\n",
        (unsigned)sizeof(NextionSummaryEvt),
@@ -340,11 +339,12 @@ static void MX_GPIO_Init(void)
     HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
 
     /*Configure GPIO pin : B1_Pin(PC13) */
-    GPIO_InitStruct.Pin = USER_BTN_Pin;
+    GPIO_InitStruct.Pin = GPIO_PIN_13;
     GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Pull = GPIO_PULLDOWN;
     HAL_GPIO_Init(USER_BTN_GPIO_Port, &GPIO_InitStruct);
-
+    HAL_NVIC_SetPriority(EXTI15_10_IRQn, QF_AWARE_ISR_CMSIS_PRI+1, 0);
+    HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
 }
 /**

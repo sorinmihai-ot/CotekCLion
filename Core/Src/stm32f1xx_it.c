@@ -20,6 +20,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "qpc_cfg.h"
+#include "qpc.h"
 #include "app_signals.h"
 #include "stm32f1xx_it.h"
 #include "bsp.h"

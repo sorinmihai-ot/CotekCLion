@@ -1,6 +1,6 @@
 #include "ao_nextion.h"
 #include "app_signals.h"
-
+#include "qpc_cfg.h"
 #include "qpc.h"
 #include "stm32f1xx_hal.h"
 #include <string.h>
@@ -55,8 +55,14 @@ static void nex_sendf(char const *fmt, ...) {
 }
 void Nextion_OnRx(uint8_t const *buf, uint16_t len) {
     // Minimal stub that compiles. Replace with event-posting if you want parsing in the AO.
-    (void)buf;
-    (void)len;
+    // (void)buf;
+    // (void)len;
+    if (len >= 2 && buf[0] == 0x66) {          // page id report
+        uint8_t pid = buf[1];                  // your IDs: 1=pWait,2=pMain,3=pDetails
+        NextionPageEvt *pg = Q_NEW(NextionPageEvt, NEX_REQ_SHOW_PAGE_SIG);
+        pg->page = pid;
+        (void)QACTIVE_POST_X(AO_Controller, &pg->super, 1U, 0U);
+    }
     /*
     NextionRxEvt *e = Q_NEW(NextionRxEvt, NEX_RX_SIG);
     size_t n = len;
@@ -80,10 +86,10 @@ static QState Nex_initial(NextionAO * const me, QEvt const * const e) {
 }
 
 static QState Nex_active(NextionAO * const me, QEvt const * const e) {
-    switch (e->sig) {
-
+    switch (e->sig)
+    {
     case Q_ENTRY_SIG: {
-        /* tell Controller we are alive */
+            /* tell Controller we are alive */
             if (!QACTIVE_POST_X(AO_Controller, Q_NEW(QEvt, NEX_READY_SIG), 1U, 0U)) {
                 /* nothing to GC because we used Q_NEW inline; this will almost never drop */
             }
@@ -91,16 +97,16 @@ static QState Nex_active(NextionAO * const me, QEvt const * const e) {
     }
 
     case NEX_REQ_SHOW_PAGE_SIG: {
-        /* 0=splash,1=wait,2=main,3=details */
-        NextionPageEvt const *pe = (NextionPageEvt const*)e;
-        switch (pe->page) {
+            /* 0=splash,1=wait,2=main,3=details */
+            NextionPageEvt const *pe = (NextionPageEvt const*)e;
+            switch (pe->page) {
             case 0: nex_send3("page pSplash");  printf("NEX: page pSplash\n");  break;
             case 1: nex_send3("page pWait");    printf("NEX: page pWait\n");    break;
             case 2: nex_send3("page pMain");    printf("NEX: page pMain\n");    break;
             case 3: nex_send3("page pDetails"); printf("NEX: page pDetails\n"); break;
             default: break;
-        }
-        return Q_HANDLED();
+            }
+            return Q_HANDLED();
     }
 
     case NEX_REQ_UPDATE_SUMMARY_SIG:
@@ -132,24 +138,44 @@ static QState Nex_active(NextionAO * const me, QEvt const * const e) {
 
             // Warning icon group visibility
             nex_sendf("vis pMain.pWarn,%d", se->warnIcon ? 1 : 0);
+#ifdef ENABLE_BMS_SIM
+            // Set tRecReason text
+            char cmd[128];
+            snprintf(cmd, sizeof(cmd), "pMain.tRecReason.txt=\"%s\"", (se->reason[0] ? se->reason : ""));
+            nex_send3(cmd);
 
-            // Recoverable widgets (use your names; here I assume text labels)
-            if (se->recoverable) {
-                nex_sendf("pMain.tRecHead.txt=\"Recoverable: YES\"");
-                if (se->reason[0] != '\0') {
-                    nex_sendf("pMain.tRecReason.txt=\"Reason: %s\"", se->reason);
-                } else {
-                    nex_sendf("pMain.tRecReason.txt=\"Reason: --\"");
-                }
+            // Set background color: green=2016 when charging, else a neutral default (e.g., 63488=red? 50712=grey?)
+            if (se->charging) {
+                nex_send3("pMain.tRecReason.bco=2016");
             } else {
-                nex_sendf("pMain.tRecHead.txt=\"Recoverable: --\"");
-                nex_sendf("pMain.tRecReason.txt=\"Reason: --\"");
+                nex_send3("pMain.tRecReason.bco=50712"); // pick your normal background; adjust if you use another
             }
 
-            // Charging group (only if you have a group)
-            // nex_sendf("vis pMain.grpCharging,%d", se->charging ? 1 : 0);
-
+            // ensure Nextion refreshes the component
+            nex_send3("ref pMain.tRecReason");
             return Q_HANDLED();
+
+#endif
+#ifndef ENABLE_BMS_SIM
+        // Recoverable widgets (use your names; here I assume text labels)
+        if (se->recoverable) {
+            nex_sendf("pMain.tRecHead.txt=\"Recoverable: YES\"");
+            if (se->reason[0] != '\0') {
+                nex_sendf("pMain.tRecReason.txt=\"Reason: %s\"", se->reason);
+            } else {
+                nex_sendf("pMain.tRecReason.txt=\"Reason: --\"");
+            }
+        } else {
+            nex_sendf("pMain.tRecHead.txt=\"Recoverable: --\"");
+            nex_sendf("pMain.tRecReason.txt=\"Reason: --\"");
+        }
+
+        // Charging group (only if you have a group)
+        // nex_sendf("vis pMain.grpCharging,%d", se->charging ? 1 : 0);
+
+        return Q_HANDLED();
+
+#endif
         }
     case NEX_REQ_UPDATE_PSU_SIG: {
             NextionPsuEvt const *pe = Q_EVT_CAST(NextionPsuEvt);
