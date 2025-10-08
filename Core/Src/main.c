@@ -194,8 +194,6 @@ int main(void)
   BSP_breadcrumb('C');
   printf("main(): UART3 up\r\n");
   //HAL_UARTEx_ReceiveToIdle_IT(&huart3, nexRx, sizeof(nexRx));
-  MX_CAN_Init();
-  CANAPP_InitAll();
   printf("main() 1\r\n");
   uint32_t prigroup = (SCB->AIRCR >> SCB_AIRCR_PRIGROUP_Pos) & 7U;
   printf("PRIGROUP=%lu\r\n", (unsigned long)prigroup);
@@ -254,6 +252,9 @@ int main(void)
   QACTIVE_START(AO_Bms, 3U, bmsQueueSto, Q_DIM(bmsQueueSto), 0, 0U, 0);
   printf("main() BmsAO up\r\n");
   /* Bring up CAN after AOs are running */
+  // NOW init + start CAN (bus mode already set to NORMAL in MX_CAN_Init)
+  MX_CAN_Init();
+  CANAPP_InitAll();    // filter+start+activate notifs
   static QEvt const bootEvt = QEVT_INITIALIZER(BOOT_SIG);
   (void)QACTIVE_POST_X(AO_Controller, &bootEvt, 1U, 0U);
   // clear any stale pending EXTI before enabling
@@ -356,7 +357,13 @@ static void MX_CAN_Init(void)
 {
   hcan.Instance = CAN1;
   hcan.Init.Prescaler = 4;
-  hcan.Init.Mode = CAN_MODE_LOOPBACK;  /////revert to normal when a battery is connected
+#if defined(ENABLE_BMS_SIM)
+  // simulator builds can use loopback if you also inject frames
+  hcan.Init.Mode = CAN_MODE_LOOPBACK;
+#else
+  // real battery: must be on the actual bus
+  hcan.Init.Mode = CAN_MODE_NORMAL;
+#endif
   hcan.Init.SyncJumpWidth = CAN_SJW_1TQ;
   hcan.Init.TimeSeg1 = CAN_BS1_13TQ;
   hcan.Init.TimeSeg2 = CAN_BS2_2TQ;

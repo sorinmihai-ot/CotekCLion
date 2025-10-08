@@ -7,7 +7,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "qpc.h"
-
+#define FEATURE_BSUT_DETECT   1   // set 0 to disable all BSUT logic
 
 /* Signals (publishable first; order matters for MAX_PUB_SIG) */
 enum AppSignals {
@@ -137,8 +137,11 @@ typedef struct {
 typedef struct {
     QEvt super;
     // Summary values for pMain
+    char classStr[12];
+    uint16_t classColor565;
     char      battTypeStr[12];     // "400s","500s","600s","Unknown"
     uint16_t  typeColor565;        // 2016 / 65504 / 1023 / 63488
+    uint16_t    battery_type_code;
     float     packV;               // from BmsTelemetry.array_voltage_V
 
     char      statusStr[24];       // from bms_state_str(bms_state)

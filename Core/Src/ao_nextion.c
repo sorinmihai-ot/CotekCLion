@@ -48,11 +48,39 @@ static void nex_sendf(char const *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    if ((size_t)n >= sizeof(buf)) n = (int)sizeof(buf) - 1;
+    buf[n] = '\0';
     va_end(ap);
     if (n < 0) return;
     if ((size_t)n >= sizeof(buf)) n = (int)(sizeof(buf) - 1);
     nex_send3(buf);
 }
+
+// Replace control/non-ASCII bytes with '?'. Prevents stray 0xFF (Nextion terminator) in payload.
+static void ascii_sanitize(char *s) {
+    for (; *s; ++s) {
+        unsigned char c = (unsigned char)*s;
+        if (c < 0x20 || c >= 0x7F) *s = '?';
+    }
+}
+
+// Build text, sanitize, then send with terminator bytes.
+// Use this for any command that writes to .txt fields.
+static void nex_send_textf(const char *fmt, ...) {
+    char buf[128];
+    memset(buf, 0, sizeof(buf));
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    if ((size_t)n >= sizeof(buf)) n = (int)sizeof(buf) - 1;
+    buf[n] = '\0';
+    va_end(ap);
+    if (n < 0) return;
+    if ((size_t)n >= sizeof(buf)) buf[sizeof(buf)-1] = '\0';
+    ascii_sanitize(buf);
+    nex_send3(buf);
+}
+
 void Nextion_OnRx(uint8_t const *buf, uint16_t len) {
     // Minimal stub that compiles. Replace with event-posting if you want parsing in the AO.
     // (void)buf;
@@ -73,6 +101,32 @@ void Nextion_OnRx(uint8_t const *buf, uint16_t len) {
     */
 }
 
+// Map battery_type_code -> label for HMI
+static char const *nex_batt_name(uint16_t code) {
+    switch (code) {
+        case 0x0600: return "600s";
+        case 0x0500: return "500s Hyperdrive";
+        case 0x0501: return "500s BMZ";
+        case 0x0400: return "400s Hyperdrive";
+        case 0x0401: return "400s Dual-Zone";
+        case 0x0402: return "400s Steatite";
+        default:     return "Unknown";
+    }
+}
+// RGB565 helpers (for reference)
+// #define RGB565(r,g,b)  ( ((r)&0xF8)<<8 | ((g)&0xFC)<<3 | ((b)>>3) )
+
+static uint16_t nex_batt_color(uint16_t code) {
+    switch (code) {
+        case 0x0600: return 0xFD20; // 600s → Orange
+        case 0x0500: return 0xFFE0; // 500s Hyperdrive → Yellow (matches your prior 65504)
+        case 0x0501: return 0xFD20; // 500s BMZ → Orange (same family color as 600s or choose distinct if you prefer)
+        case 0x0400: return 0x07E0; // 400s Hyperdrive → Green (2016)
+        case 0x0401: return 0x07FF; // 400s Dual-Zone → Teal/Cyan
+        case 0x0402: return 0x001F; // 400s Steatite → Blue
+        default:     return 0xC618; // Unknown → Neutral grey (50712)
+    }
+}
 /* ====== ctor ====== */
 void NextionAO_ctor(void) {
     QActive_ctor(&l_nex.super, Q_STATE_CAST(&Nex_initial));
@@ -106,6 +160,7 @@ static QState Nex_active(NextionAO * const me, QEvt const * const e) {
             case 3: nex_send3("page pDetails"); printf("NEX: page pDetails\n"); break;
             default: break;
             }
+
             return Q_HANDLED();
     }
 
@@ -115,59 +170,63 @@ static QState Nex_active(NextionAO * const me, QEvt const * const e) {
 
             // Battery type text and color bar
             if (se->battTypeStr[0] != '\0') {
-                nex_sendf("pMain.tBattType.txt=\"Battery: %s\"", se->battTypeStr);
-                nex_sendf("pMain.rTypeBar.bco=%u", (unsigned)se->typeColor565);
+                nex_send_textf("pMain.tBattType.txt=\"Battery: %s\"", se->battTypeStr);
+                nex_sendf      ("pMain.rTypeBar.bco=%u", (unsigned)se->typeColor565);
             }
+        // show classification label/color (on real batteries it will be Operational/Recoverable/Not Recoverable;
+        // on SIM builds it will show "SIM" in grey)
+        nex_send_textf("pMain.tRecHead.txt=\"%s\"", se->classStr);
+        nex_sendf      ("pMain.tRecHead.pco=%u", (unsigned)se->classColor565);
+        nex_send3("ref pMain.tRecHead");
 
             // Pack voltage
-            nex_sendf("pMain.tVolt.txt=\"%.2f V\"", se->packV);
+            nex_send_textf("pMain.tVolt.txt=\"%.2f V\"", se->packV);
 
             // Status text (no color usage -> you can leave statusColor565 unused)
             if (se->statusStr[0] != '\0') {
-                nex_sendf("pMain.tStatus.txt=\"%s\"", se->statusStr);
+                nex_send_textf("pMain.tStatus.txt=\"%s\"", se->statusStr);
                 // If you later choose to color the status text or bar:
                 // nex_sendf("pMain.rStBar.bco=%u", (unsigned)se->statusColor565);
             }
 
             // Errors line (or "None")
             if (se->errors[0] != '\0') {
-                nex_sendf("pMain.tErrors.txt=\"%s\"", se->errors);
+                nex_send_textf("pMain.tErrors.txt=\"%s\"", se->errors);
             } else {
-                nex_sendf("pMain.tErrors.txt=\"None\"");
+                nex_send_textf("pMain.tErrors.txt=\"None\"");
             }
 
             // Warning icon group visibility
-            nex_sendf("vis pMain.pWarn,%d", se->warnIcon ? 1 : 0);
+            nex_send_textf("vis pMain.pWarn,%d", se->warnIcon ? 1 : 0);
 #ifdef ENABLE_BMS_SIM
             // Set tRecReason text
             char cmd[128];
-            snprintf(cmd, sizeof(cmd), "pMain.tRecReason.txt=\"%s\"", (se->reason[0] ? se->reason : ""));
-            nex_send3(cmd);
+            snprintf(cmd, sizeof(cmd), "pMain.tAppStatus.txt=\"%s\"", (se->reason[0] ? se->reason : ""));
+            nex_send_textf("%s", cmd);
 
             // Set background color: green=2016 when charging, else a neutral default (e.g., 63488=red? 50712=grey?)
             if (se->charging) {
-                nex_send3("pMain.tRecReason.bco=2016");
+                nex_send3("pMain.tAppStatus.bco=2016");
             } else {
-                nex_send3("pMain.tRecReason.bco=50712"); // pick your normal background; adjust if you use another
+                nex_send3("pMain.tAppStatus.bco=50712"); // pick your normal background; adjust if you use another
             }
 
             // ensure Nextion refreshes the component
-            nex_send3("ref pMain.tRecReason");
+            nex_send3("ref pMain.tAppStatus");
             return Q_HANDLED();
 
 #endif
 #ifndef ENABLE_BMS_SIM
         // Recoverable widgets (use your names; here I assume text labels)
         if (se->recoverable) {
-            nex_sendf("pMain.tRecHead.txt=\"Recoverable: YES\"");
-            if (se->reason[0] != '\0') {
-                nex_sendf("pMain.tRecReason.txt=\"Reason: %s\"", se->reason);
-            } else {
-                nex_sendf("pMain.tRecReason.txt=\"Reason: --\"");
-            }
+            nex_send_textf("pMain.tRecHead.txt=\"Recoverable: YES\"");
+            if (se->reason[0] != '\0')
+                nex_send_textf("pMain.tRecReason.txt=\"Reason: %s\"", se->reason);
+            else
+                nex_send_textf("pMain.tRecReason.txt=\"Reason: --\"");
         } else {
-            nex_sendf("pMain.tRecHead.txt=\"Recoverable: --\"");
-            nex_sendf("pMain.tRecReason.txt=\"Reason: --\"");
+            nex_send_textf("pMain.tRecHead.txt=\"Recoverable: --\"");
+            nex_send_textf("pMain.tRecReason.txt=\"Reason: --\"");
         }
 
         // Charging group (only if you have a group)
@@ -178,39 +237,37 @@ static QState Nex_active(NextionAO * const me, QEvt const * const e) {
 #endif
         }
     case NEX_REQ_UPDATE_PSU_SIG: {
-            NextionPsuEvt const *pe = Q_EVT_CAST(NextionPsuEvt);
+        NextionPsuEvt const *pe = Q_EVT_CAST(NextionPsuEvt);
 
-            nex_sendf("pMain.tPsu.txt=\"PSU: %s\"", pe->present ? "Detected" : "Missing");
-            nex_sendf("pMain.tOutState.txt=\"Output: %s\"", pe->output_on ? "ON" : "OFF");
+        nex_send_textf("pMain.tPsu.txt=\"PSU: %s\"", pe->present ? "Detected" : "Missing");
+        nex_send_textf("pMain.tOutState.txt=\"Output: %s\"", pe->output_on ? "ON" : "OFF");
+        if (pe->v_out >= 0.0f)  nex_send_textf("pMain.tOutV.txt=\"Vout: %.1f V\"", pe->v_out);
+        if (pe->i_out >= 0.0f)  nex_send_textf("pMain.tOutI.txt=\"Iout: %.1f A\"", pe->i_out);
+        if (pe->temp_C > -90.0f && pe->temp_C < 200.0f)
+            nex_send_textf("pMain.tOutT.txt=\"Temp: %.0f C\"", pe->temp_C);  // ASCII only
+        // colors can stay with nex_sendf
+        nex_sendf("pMain.tPsu.bco=%u",      pe->present   ? 2016U : 63488U);
+        nex_sendf("pMain.tOutState.bco=%u", pe->output_on ? 2016U : 63488U);
 
-            if (pe->v_out >= 0.0f)  nex_sendf("pMain.tOutV.txt=\"Vout: %.1f V\"", pe->v_out);
-            if (pe->i_out >= 0.0f)  nex_sendf("pMain.tOutI.txt=\"Iout: %.1f A\"", pe->i_out);
-            if (pe->temp_C > -90.0f && pe->temp_C < 200.0f)
-                nex_sendf("pMain.tOutT.txt=\"Temp: %.0f °C\"", pe->temp_C);
-
-            // background colors (red/green)
-            nex_sendf("pMain.tPsu.bco=%u",      pe->present   ? 2016U : 63488U);
-            nex_sendf("pMain.tOutState.bco=%u", pe->output_on ? 2016U : 63488U);
-
-            return Q_HANDLED();
+        return Q_HANDLED();
     }
     case NEX_REQ_UPDATE_DETAILS_SIG: {
             NextionDetailsEvt const *de = Q_EVT_CAST(NextionDetailsEvt);
 
             // voltage
-            nex_sendf("pDetails.tHVolt.txt=\"%.2f\"", de->high_voltage_V);
-            nex_sendf("pDetails.tLVolt.txt=\"%.2f\"", de->low_voltage_V);
-            nex_sendf("pDetails.tAVolt.txt=\"%.2f\"", de->avg_voltage_V);
+            nex_send_textf("pDetails.tHVolt.txt=\"%.2f\"", de->high_voltage_V);
+            nex_send_textf("pDetails.tLVolt.txt=\"%.2f\"", de->low_voltage_V);
+            nex_send_textf("pDetails.tAVolt.txt=\"%.2f\"", de->avg_voltage_V);
 
             // temps
-            nex_sendf("pDetails.tHTemp.txt=\"%.1f\"", de->high_temp_C);
-            nex_sendf("pDetails.tLTemp.txt=\"%.1f\"", de->low_temp_C);
-            nex_sendf("pDetails.tPackHTemp.txt=\"%.1f\"", de->pack_high_temp_C);
-            nex_sendf("pDetails.tPackLTemp.txt=\"%.1f\"", de->pack_low_temp_C);
+            nex_send_textf("pDetails.tHTemp.txt=\"%.1f\"", de->high_temp_C);
+            nex_send_textf("pDetails.tLTemp.txt=\"%.1f\"", de->low_temp_C);
+            nex_send_textf("pDetails.tPackHTemp.txt=\"%.1f\"", de->pack_high_temp_C);
+            nex_send_textf("pDetails.tPackLTemp.txt=\"%.1f\"", de->pack_low_temp_C);
 
             // serial, FW
-            nex_sendf("pDetails.tSerialN.txt=\"%s\"", de->serial_number);
-            nex_sendf("pDetails.tFW.txt=\"%s\"",      de->firmware);
+            nex_send_textf("pDetails.tSerialN.txt=\"%s\"", de->serial_number);
+            nex_send_textf("pDetails.tFW.txt=\"%s\"",      de->firmware);
 
             // fan / soc
             nex_sendf("pDetails.tFanSpeed.txt=\"%u\"", (unsigned)de->fan_speed_rpm);
@@ -218,8 +275,8 @@ static QState Nex_active(NextionAO * const me, QEvt const * const e) {
             nex_sendf("pDetails.tSoC2.txt=\"%u%%\"",   (unsigned)de->soc2_percent);
 
             // state / fault
-            nex_sendf("pDetails.tBmsState.txt=\"%s\"", de->bms_state_str);
-            nex_sendf("pDetails.tBmsFault.txt=\"BMS_fault: %s\"", de->bms_fault_str);
+            nex_send_textf("pDetails.tBmsState.txt=\"%s\"", de->bms_state_str);
+            nex_send_textf("pDetails.tBmsFault.txt=\"BMS_fault: %s\"", de->bms_fault_str);
 
             return Q_HANDLED();
     }

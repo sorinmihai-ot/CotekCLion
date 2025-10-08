@@ -147,98 +147,44 @@ static QState Cotek_active(CotekAO * const me, QEvt const * const e)
 {
     switch (e->sig)
     {
-        // case COTEK_TICK_SIG: {
-        //     uint16_t rawV, rawI;  uint8_t rawT, ctrl;
-        //     uint8_t okV = i2c_read_u16(0x60, &rawV);
-        //     uint8_t okI = i2c_read_u16(0x62, &rawI);
-        //     uint8_t okT = i2c_read_u8 (0x68, &rawT);
-        //     uint8_t okC = cotek_read_control(&ctrl);   // already defined above
-        //
-        //     uint8_t okAny = (okV || okI || okT || okC);
-        //
-        //     if (okAny) {
-        //         me->alive_ms = 0U;                 // we truly heard from the PSU
-        //         if (okV) me->v_out = rawV / 100.0f;
-        //         if (okI) me->i_out = rawI / 100.0f;
-        //         if (okT) me->t_out = (float)rawT;
-        //         if (okC) me->out_on = ((ctrl & 0x01U) != 0U);   // bit0 = power
-        //     } else {
-        //         if (me->alive_ms < 5000U) { me->alive_ms += 200U; }
-        //     }
-        //
-        //     uint8_t new_present = (me->alive_ms <= 1000U) ? 1U : 0U;
-        //     me->present = new_present;
-        //
-        //     static uint8_t last_present = 0xFFU, last_out_on = 0xFFU;
-        //     static float last_v = -999.0f, last_i = -999.0f, last_t = -999.0f;
-        //
-        //     if (   (new_present != last_present)
-        //         || (me->out_on   != last_out_on)
-        //         || (fabsf(last_v - me->v_out) > 0.05f)
-        //         || (fabsf(last_i - me->i_out) > 0.05f)
-        //         || (fabsf(last_t - me->t_out) > 0.5f)) {
-        //
-        //         last_present = new_present;
-        //         last_out_on  = me->out_on;
-        //         last_v       = me->v_out;
-        //         last_i       = me->i_out;
-        //         last_t       = me->t_out;
-        //
-        //         post_psu(me, new_present, me->out_on, me->v_out, me->i_out, me->t_out);
-        //         publish_status(me);
-        //         }
-        //     return Q_HANDLED();
-        // }
-
-
-            /* ... then your existing presence-aging + publish-if-changed code ... */
-
             case COTEK_TICK_SIG: {
-                    float v = cotek_read_voltage();      // your existing function
-                    float i = cotek_read_current();      // your existing function
-                    float t = cotek_read_temperature();  // your existing function
-                    // non-blocking poll: start/advance one small read each tick
-                    // e.g., issue one command here; return immediately
-                    // If reads succeeded, consider the PSU "alive".
-                    // (If you can detect I2C error, gate this with that.)
+                uint16_t rawV = 0, rawI = 0;   uint8_t rawT = 0, ctrl = 0;
+                uint8_t okV = i2c_read_u16(0x60, &rawV);          // V*100
+                uint8_t okI = i2c_read_u16(0x62, &rawI);          // A*100
+                uint8_t okT = i2c_read_u8 (0x68, &rawT);          // °C
+                uint8_t okC = cotek_read_control(&ctrl);          // bit0=ON
+
+                uint8_t okAny = (okV || okI || okT || okC);
+                if (okAny) {
                     me->alive_ms = 0U;
+                    if (okV) me->v_out = (float)rawV / 100.0f;
+                    if (okI) me->i_out = (float)rawI / 100.0f;
+                    if (okT) me->t_out = (float)rawT;
+                    if (okC) me->out_on = ((ctrl & 0x01U) != 0U);  // bit0 = output enable
+                } else {
+                    if (me->alive_ms < 5000U) { me->alive_ms += 200U; } // 200 ms tick
+                }
+                uint8_t new_present = (me->alive_ms <= 1000U) ? 1U : 0U;
+                me->present = new_present;
 
-                    // Update last-known readings (for UI)
-                    me->v_out = v;
-                    me->i_out = i;
-                    me->t_out = t;
+                static uint8_t last_present = 0xFFU, last_out_on = 0xFFU;
+                static float   last_v = -999.0f, last_i = -999.0f, last_t = -999.0f;
 
-                    // For now, infer output ON/OFF from your AO state (or wire to real status if you have it)
-                    me->out_on = (me->on != 0U);
+                if (   (new_present != last_present)
+                    || (me->out_on   != last_out_on)
+                    || (fabsf(last_v - me->v_out) > 0.05f)
+                    || (fabsf(last_i - me->i_out) > 0.05f)
+                    || (fabsf(last_t - me->t_out) > 0.5f)) {
 
-                    // ---- 2) age the "alive" timer & compute presence ----
-                    // Tick period ~200ms; cap at a few seconds
-                    if (me->alive_ms < 5000U) {
-                        me->alive_ms += 200U;
-                    }
+                    last_present = new_present;
+                    last_out_on  = me->out_on;
+                    last_v       = me->v_out;
+                    last_i       = me->i_out;
+                    last_t       = me->t_out;
 
-                    uint8_t new_present = (me->alive_ms <= 1000U) ? 1U : 0U;
-                    me->present = new_present;   // <-- keep the public presence flag in sync
-                    // ---- 3) publish only if something visible changed ----
-                    static uint8_t last_present = 0xFFU;  // force first publish
-                    static uint8_t last_out_on;
-                    static float last_v, last_i, last_t;
-
-                    if (new_present != last_present ||
-                        me->out_on   != last_out_on  ||
-                        fabsf(me->v_out - last_v) > 0.05f ||
-                        fabsf(me->i_out - last_i) > 0.05f ||
-                        fabsf(me->t_out - last_t) > 0.5f)
-                    {
-                        last_present = new_present;
-                        last_out_on  = me->out_on;
-                        last_v = me->v_out;
-                        last_i = me->i_out;
-                        last_t = me->t_out;
-
-                        post_psu(me, new_present, me->out_on, me->v_out, me->i_out, me->t_out);
-                        publish_status(me);
-                    }
+                    post_psu(me, new_present, me->out_on, me->v_out, me->i_out, me->t_out);
+                    publish_status(me);
+    }
                     return Q_HANDLED();
             }
             case PSU_REQ_SETPOINT_SIG: {
