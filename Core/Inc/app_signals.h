@@ -23,7 +23,8 @@ enum AppSignals {
     TIMEOUT_SIG , /* used by QTimeEvt; not published           */
     CHARGE_TIMEOUT_SIG,      // <-- new: 30s charge window elapsed
     PSU_OFF_WAIT_TO_SIG,     // internal: watchdog while we wait for OFF confirmation
-    BMS_TICK_SIG,              /* internal periodic tick for BMS            */
+    BMS_TICK_SIG,              /* internal periodic tick for BMS*/
+    BMS_WATCHDOG_TO_SIG,   // controller-side: no BMS updates in the timeout window
 #ifdef ENABLE_BMS_SIM
     SIM_TICK_SIG,          /* private periodic tick for the in-firmware BMS simulator */
 #endif
@@ -81,6 +82,7 @@ typedef struct {
 
     uint8_t  last_error_class;
     uint8_t  last_error_code;
+    uint8_t  bms_fault_raw;     // family-specific raw fault byte (0 if N/A)
 
     uint16_t battery_type_code;  /* 0x400=400s, 0x500=500s, 0x600=600s */
     int16_t  current_dA;         /* deci-amps (+ charge, - discharge) */
@@ -141,7 +143,7 @@ typedef struct {
     uint16_t classColor565;
     char      battTypeStr[12];     // "400s","500s","600s","Unknown"
     uint16_t  typeColor565;        // 2016 / 65504 / 1023 / 63488
-    uint16_t    battery_type_code;
+    uint16_t  battery_type_code;
     float     packV;               // from BmsTelemetry.array_voltage_V
 
     char      statusStr[24];       // from bms_state_str(bms_state)
@@ -153,11 +155,11 @@ typedef struct {
     uint8_t   charging;            // show “charging” group? 0/1
 
     // ---- PSU (Cotek) summary for pMain ----
-    uint8_t psu_present;   // 1/0
-    uint8_t psu_out_on;    // 1/0
-    float   psu_v;         // volts
-    float   psu_i;         // amps
-    float   psu_t;         // degC
+    uint8_t   psu_present;   // 1/0
+    uint8_t   psu_out_on;    // 1/0
+    float     psu_v;         // volts
+    float     psu_i;         // amps
+    float     psu_t;         // degC
 
     // Optional “reason” breadcrumb you print to UART only
     char      reason[96];

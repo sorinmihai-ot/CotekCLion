@@ -52,7 +52,7 @@
 #include "stm32f1xx_hal_i2c.h"
 
 //Firmware Version
-const char FW_VERSION_STR[] = "0.4.1";
+const char FW_VERSION_STR[] = "0.4.2";
 static uint8_t nexRx[128];
 /* HMI RX buffer (visible to main and callbacks) */
 uint8_t s_uart3_rxbuf[128];

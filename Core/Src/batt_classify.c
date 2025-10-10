@@ -144,7 +144,7 @@ BattClassResult batt_classify(const BmsTelemetry *t, bool bms_sim_active) {
     /* 2) Recoverable window: min >= family_low  && max <= 3.8, and no NR errors */
     if ( (vmin >= low_ok) && (vmax <= high_ok) ) {
         r.cls = BATT_CLASS_RECOVERABLE;
-        r.label = "Recoverable";
+        r.label = "Batt Recoverable";
         r.color565 = COL_AMBER;
 
         static char why[32];
@@ -156,7 +156,7 @@ BattClassResult batt_classify(const BmsTelemetry *t, bool bms_sim_active) {
     /* 3) Operational: max > 3.8 and no NR errors */
     if (vmax > high_ok) {
         r.cls = BATT_CLASS_OPERATIONAL;
-        r.label = "Operational";
+        r.label = "Batt Operational";
         r.color565 = COL_GREEN;
         r.reason = "max>3.8";
         return r;
@@ -164,7 +164,7 @@ BattClassResult batt_classify(const BmsTelemetry *t, bool bms_sim_active) {
 
     /* 4) Otherwise treat as Not Recoverable (e.g., min below family threshold) */
     r.cls = BATT_CLASS_NOT_RECOVERABLE;
-    r.label = "Not Recoverable";
+    r.label = "Batt Not Recoverable";
     r.color565 = COL_RED;
 
     if (vmin < low_ok) {

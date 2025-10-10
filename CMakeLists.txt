@@ -89,6 +89,7 @@ add_executable(CotekCLion.elf ${APP_SOURCES} ${STARTUP_FILE}
         Core/Src/batt_classify.c
         Core/Inc/can_proto.h
         Core/Src/bsut.c
+        Core/Src/bms_fault_decode.c
 )
 
 # --- Include paths ---

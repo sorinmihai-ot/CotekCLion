@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include "bms_fault_decode.h"
 
 Q_DEFINE_THIS_FILE
 
@@ -163,6 +164,7 @@ int BMS_ParseFrame(CanFrameEvt const *f, BmsTelemetry *b)
             b->array_voltage_V = (float)v10 * 0.1f;
             b->bms_state       = d[4];                 /* enum */
             b->bms_fault       = (d[5] != 0U) ? 1U : 0U; /* any bit -> fault present */
+            b->bms_fault_raw   = d[5];
 
             /* d[6] is "Battery Type" enumeration in BMZ doc; optional to store */
             printf("BMS: BMZ state=%s fault=%s (raw=0x%02X)\r\n",
@@ -222,6 +224,7 @@ int BMS_ParseFrame(CanFrameEvt const *f, BmsTelemetry *b)
             case 0x18FF0300u: /* State/fault */
                 if (dlc >= 2) {
                     b->bms_fault = d[0];
+                    b->bms_fault_raw = d[0];
                     uint8_t s = d[1];
                     switch (s) {
                         case 0: case 1: case 2: case 3:
@@ -373,6 +376,7 @@ int BMS_ParseFrame(CanFrameEvt const *f, BmsTelemetry *b)
                 if (dlc >= 7) {
                     uint8_t faultBit = (d[2] >> 6) & 0x01u;
                     b->bms_fault  = faultBit ? 1U : 0U;
+                    b->bms_fault_raw = 0U;   // <--- keep 0, no raw byte defined for this family here
                     b->bms_state  = d[3];
                     b->soc_percent = d[6] ? d[6] : d[5];
                     printf("BMS: state=%s fault=%s\r\n",

@@ -105,6 +105,7 @@ static uint8_t cotek_read_control(uint8_t *ctrl) {
     return 1U;
 }
 static uint8_t i2c_read_u16(uint8_t reg, uint16_t *out) {
+    *out = 0;
     if (HAL_I2C_Master_Transmit(&hi2c1, COTEK_I2C_ADDR, &reg, 1, I2C_TIMEOUT_MS) != HAL_OK) {
         return 0U;
     }

@@ -90,6 +90,16 @@ void Nextion_OnRx(uint8_t const *buf, uint16_t len) {
         NextionPageEvt *pg = Q_NEW(NextionPageEvt, NEX_REQ_SHOW_PAGE_SIG);
         pg->page = pid;
         (void)QACTIVE_POST_X(AO_Controller, &pg->super, 1U, 0U);
+        return;
+    }
+    if (len >= 5 && buf[0] == 0x71) {               // numeric return from "get"
+        // value is little-endian 32-bit
+        uint32_t val = (uint32_t)buf[1]
+                     | ((uint32_t)buf[2] << 8)
+                     | ((uint32_t)buf[3] << 16)
+                     | ((uint32_t)buf[4] << 24);
+        printf("NEX>> numeric: %lu\r\n", (unsigned long)val);
+        return;
     }
     /*
     NextionRxEvt *e = Q_NEW(NextionRxEvt, NEX_RX_SIG);
@@ -156,7 +166,11 @@ static QState Nex_active(NextionAO * const me, QEvt const * const e) {
             switch (pe->page) {
             case 0: nex_send3("page pSplash");  printf("NEX: page pSplash\n");  break;
             case 1: nex_send3("page pWait");    printf("NEX: page pWait\n");    break;
-            case 2: nex_send3("page pMain");    printf("NEX: page pMain\n");    break;
+                case 2: nex_send3("page pMain");
+                    printf("NEX: page pMain\n");    // ensure warning icon starts hidden each time we arrive on pMain
+                    nex_send3("vis pMain.pWarn,0");
+                    nex_send3("ref pMain.pWarn");
+                    break;
             case 3: nex_send3("page pDetails"); printf("NEX: page pDetails\n"); break;
             default: break;
             }
@@ -197,7 +211,26 @@ static QState Nex_active(NextionAO * const me, QEvt const * const e) {
             }
 
             // Warning icon group visibility
-            nex_send_textf("vis pMain.pWarn,%d", se->warnIcon ? 1 : 0);
+
+        const uint8_t want = se->warnIcon ? 1U : 0U;
+        nex_send_textf("vis pMain.pWarn,%u", want);
+        nex_send3("ref pMain.pWarn");
+
+        // if (want) {
+        //     nex_send3("pMain.pWarn.pic=3");   // your real icon ID
+        //     nex_send3("vis pMain.pWarn,1");
+        // } else {
+        //     nex_send3("pMain.pWarn.pic=0");   // empty / nothing
+        //     nex_send3("vis pMain.pWarn,0");
+        // }
+        // nex_send3("ref pMain.pWarn");
+        // nex_send3("get pMain.pWarn.pic");     // optional: should be 0 or 2
+        // nex_send3("get pMain.pWarn.vis");     // optional: should be 0 or 1
+
+        // debug trace
+        printf("NEX: pWarn vis=%u (charging=%u, warnIcon=%u)\r\n",
+               (unsigned)want, (unsigned)se->charging, (unsigned)se->warnIcon);
+
 #ifdef ENABLE_BMS_SIM
             // Set tRecReason text
             char cmd[128];
@@ -216,26 +249,14 @@ static QState Nex_active(NextionAO * const me, QEvt const * const e) {
             return Q_HANDLED();
 
 #endif
-#ifndef ENABLE_BMS_SIM
-        // Recoverable widgets (use your names; here I assume text labels)
-        if (se->recoverable) {
-            nex_send_textf("pMain.tRecHead.txt=\"Recoverable: YES\"");
-            if (se->reason[0] != '\0')
-                nex_send_textf("pMain.tRecReason.txt=\"Reason: %s\"", se->reason);
-            else
-                nex_send_textf("pMain.tRecReason.txt=\"Reason: --\"");
+        if (se->reason[0] != '\0') {
+            nex_send_textf("pMain.tRecReason.txt=\"%s\"", se->reason);
         } else {
-            nex_send_textf("pMain.tRecHead.txt=\"Recoverable: --\"");
-            nex_send_textf("pMain.tRecReason.txt=\"Reason: --\"");
+            nex_send_textf("pMain.tRecReason.txt=\"\"");
         }
-
-        // Charging group (only if you have a group)
-        // nex_sendf("vis pMain.grpCharging,%d", se->charging ? 1 : 0);
-
         return Q_HANDLED();
-
-#endif
         }
+
     case NEX_REQ_UPDATE_PSU_SIG: {
         NextionPsuEvt const *pe = Q_EVT_CAST(NextionPsuEvt);
 
@@ -251,6 +272,7 @@ static QState Nex_active(NextionAO * const me, QEvt const * const e) {
 
         return Q_HANDLED();
     }
+
     case NEX_REQ_UPDATE_DETAILS_SIG: {
             NextionDetailsEvt const *de = Q_EVT_CAST(NextionDetailsEvt);
 
