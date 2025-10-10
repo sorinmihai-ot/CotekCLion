@@ -52,7 +52,7 @@
 #include "stm32f1xx_hal_i2c.h"
 
 //Firmware Version
-const char FW_VERSION_STR[] = "0.4.0";
+const char FW_VERSION_STR[] = "0.4.2";
 static uint8_t nexRx[128];
 /* HMI RX buffer (visible to main and callbacks) */
 uint8_t s_uart3_rxbuf[128];
@@ -194,8 +194,6 @@ int main(void)
   BSP_breadcrumb('C');
   printf("main(): UART3 up\r\n");
   //HAL_UARTEx_ReceiveToIdle_IT(&huart3, nexRx, sizeof(nexRx));
-  MX_CAN_Init();
-  CANAPP_InitAll();
   printf("main() 1\r\n");
   uint32_t prigroup = (SCB->AIRCR >> SCB_AIRCR_PRIGROUP_Pos) & 7U;
   printf("PRIGROUP=%lu\r\n", (unsigned long)prigroup);
@@ -222,10 +220,6 @@ int main(void)
        (unsigned long)(sizeof(s_canPoolSto) / sizeof(s_canPoolSto[0])),
        (unsigned long)(sizeof(s_bmsPoolSto) / sizeof(s_bmsPoolSto[0])),
        UI_POOL_BLOCK_SIZE);
-  // char verCmd[64];
-  // snprintf(verCmd, sizeof verCmd, "pSplash.tVer.txt=\"FW v%s\"", FW_VERSION_STR);
-  // nex_send3(verCmd);
-  //nex_send3("tVer.txt=\"FW v0.3.1\"");
 
   printf("main() 3\r\n");
   static int const qfAwarePri_compiled = QF_AWARE_ISR_CMSIS_PRI;
@@ -258,6 +252,9 @@ int main(void)
   QACTIVE_START(AO_Bms, 3U, bmsQueueSto, Q_DIM(bmsQueueSto), 0, 0U, 0);
   printf("main() BmsAO up\r\n");
   /* Bring up CAN after AOs are running */
+  // NOW init + start CAN (bus mode already set to NORMAL in MX_CAN_Init)
+  MX_CAN_Init();
+  CANAPP_InitAll();    // filter+start+activate notifs
   static QEvt const bootEvt = QEVT_INITIALIZER(BOOT_SIG);
   (void)QACTIVE_POST_X(AO_Controller, &bootEvt, 1U, 0U);
   // clear any stale pending EXTI before enabling
@@ -273,8 +270,11 @@ int main(void)
   nex_send3("bkcmd=3");             HAL_Delay(20);
   nex_send3("rest");                HAL_Delay(1100);  // give HMI time to reboot
   nex_send3("page pSplash");        HAL_Delay(50);
-  nex_send3("pSplash.tVer.txt=\"FW v0.3.1\"");
-  //nex_send3("ref pSplash.tVer");
+  char verCmd[64];
+  snprintf(verCmd, sizeof verCmd, "pSplash.tVer.txt=\"FW v%s\"", FW_VERSION_STR);
+  nex_send3(verCmd);
+  //nex_send3("pSplash.tVer.txt=\"FW v0.3.1\"");
+  nex_send3("ref pSplash.tVer");
   HAL_Delay(3000);
   printf("sizeof(NextionSummaryEvt)=%u  Details=%u\r\n",
        (unsigned)sizeof(NextionSummaryEvt),
@@ -340,11 +340,12 @@ static void MX_GPIO_Init(void)
     HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
 
     /*Configure GPIO pin : B1_Pin(PC13) */
-    GPIO_InitStruct.Pin = USER_BTN_Pin;
+    GPIO_InitStruct.Pin = GPIO_PIN_13;
     GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Pull = GPIO_PULLDOWN;
     HAL_GPIO_Init(USER_BTN_GPIO_Port, &GPIO_InitStruct);
-
+    HAL_NVIC_SetPriority(EXTI15_10_IRQn, QF_AWARE_ISR_CMSIS_PRI+1, 0);
+    HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
 }
 /**
@@ -356,7 +357,13 @@ static void MX_CAN_Init(void)
 {
   hcan.Instance = CAN1;
   hcan.Init.Prescaler = 4;
-  hcan.Init.Mode = CAN_MODE_LOOPBACK;  /////revert to normal when a battery is connected
+#if defined(ENABLE_BMS_SIM)
+  // simulator builds can use loopback if you also inject frames
+  hcan.Init.Mode = CAN_MODE_LOOPBACK;
+#else
+  // real battery: must be on the actual bus
+  hcan.Init.Mode = CAN_MODE_NORMAL;
+#endif
   hcan.Init.SyncJumpWidth = CAN_SJW_1TQ;
   hcan.Init.TimeSeg1 = CAN_BS1_13TQ;
   hcan.Init.TimeSeg2 = CAN_BS2_2TQ;

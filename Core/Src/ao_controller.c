@@ -1,4 +1,5 @@
 #include "qpc_cfg.h"
+#include "qpc.h"
 #include "ao_controller.h"
 #include "ao_nextion.h"
 #include "ao_cotek.h"
@@ -9,38 +10,161 @@
 #include <string.h>
 #include "stm32f1xx_hal.h"
 #include <math.h>
+#include "batt_classify.h"
+#include "bms_fault_decode.h"
 
 static uint32_t s_last_sum_ms;
 static uint32_t s_last_det_ms;
 static uint32_t s_last_sum_hash, s_last_det_hash;
+static uint32_t last_bms_ms;
+// Use the mapper from bms_app.c
+extern const char *BMS_state_to_text(uint16_t batt_type, uint8_t raw_state);
+static inline bool bms_sim_is_active(void) {
+#ifdef ENABLE_BMS_SIM
+    return true;      // SIM build: treat as active, never classify/gate
+#else
+    return false;     // Non-SIM build: classification will run
+#endif
+}
 
 Q_DEFINE_THIS_FILE
+typedef enum
+{
+    CTL_STATE_WAIT=0,
+    CTL_STATE_DETECT,
+    CTL_STATE_CHARGE
+} ctl_state_t;
+
 
 typedef struct {
     QActive  super;
+    QTimeEvt tBmsWatch;   // new: BMS RX watchdog
     QTimeEvt ui2s;      /* periodic UI refresh (2s) */
     QTimeEvt tCharge;   /* charging timeout (60s) */
+    QTimeEvt tPsuOff;    // short watchdog while waiting for OFF confirm
     uint8_t page;
     BmsTelemetry last;
     uint8_t      haveData;
 #ifdef ENABLE_BMS_SIM
     QTimeEvt simTick;
 #endif
+    ctl_state_t state;
+    uint8_t psu_present, psu_out_on;
+    float   psu_v_out, psu_i_out, psu_temp;
 } ControllerAO;
 
-static void post_page(uint8_t page);
+static void post_page_ex(ControllerAO *me, uint8_t page);
 static void make_summary(NextionSummaryEvt *se, const BmsTelemetry *t);
 extern volatile uint16_t g_lastSig;
 extern volatile uint8_t  g_lastTag;
-static uint32_t s_last_ui_ms;
+//static uint32_t s_last_ui_ms;
+static BmsBatteryFamily fam_from_code(uint16_t code) {
+    switch (code) {
+        case 0x0500: return BMS_FAM_HYP500;         // 500s Hyperdrive (J1939)
+        case 0x0501: return BMS_FAM_BMZ500;         // 500s BMZ (extended)
+        case 0x0600: return BMS_FAM_CP600;          // 600s CP (extended)
+        case 0x0401: return BMS_FAM_CP400_DUAL;     // 400s Dual-Zone
+        case 0x0402: return BMS_FAM_CP400_CHILL;    // 400s Steatite (treat as chill-only)
+        case 0x0400: /* fall-through */
+        default:     return BMS_FAM_CP400_CHILL;    // generic 400s
+    }
+}
 
+static void decode_faults_for_ui(const BmsTelemetry *t,
+                                 char *out_text, size_t out_len,
+                                 BmsSeverity *out_sev) {
+    if (!t || !out_text || out_len == 0) return;
+    out_text[0] = '\0';
+    if (out_sev) *out_sev = BMS_SEV_NONE;
+
+    BmsSeverity    sev = BMS_SEV_NONE;
+    BmsDomainMask  dom = BMS_DOM_NONE;
+
+    switch (t->battery_type_code) {
+        case 0x0500: { // 500s Hyperdrive (J1939)
+            bms_decode_hyp500(
+                /* hw_fault      */ t->bms_fault_raw,      // your parse fills this from 0x18FF0300 byte0
+                /* error_sev_raw */ t->last_error_class,   // from 0x18FF0E00
+                /* error_code    */ t->last_error_code,    // from 0x18FF0E00
+                out_text, out_len, &sev, &dom);
+        } break;
+
+        case 0x0501:   // 500s BMZ (extended)
+        case 0x0600: { // 600s CP (extended)
+            bms_decode_bmz500_cp600(
+                /* pack_fault */ t->bms_fault_raw,     // from 0x10000010 byte5 in your parse
+                out_text, out_len, &sev, &dom);
+        } break;
+
+        case 0x0400:   // 400s Hyperdrive (base)
+        case 0x0401:   // 400s Dual-Zone
+        case 0x0402: { // 400s Steatite
+            /* We don’t have all the detailed boolean flags yet; use what we have.
+               Map last_error_class into a coarse “master fault code”, and mark
+               the usual suspects as false for now. You can refine these as you
+               parse more 400s bits. */
+            BmsCp400Input in = {0};
+            /* Coarse mapping:
+               0=Normal, 1=Warning, 2=Fault, 3=Permanent, 4=HW Fault (per header comment) */
+            if (t->last_error_class) {
+                in.master_fault_code = t->last_error_class;
+            } else if (t->bms_fault) {
+                in.master_fault_code = 2; // any fault present -> “Fault”
+            } else {
+                in.master_fault_code = 0; // Normal
+            }
+            in.uv = in.ov = in.ot = in.ut = false;
+            in.dchg_oc = in.chg_oc = false;
+            in.therm_warning = false;
+            in.imbalance = false;
+
+            bms_decode_cp400(&in, out_text, out_len, &sev, &dom);
+        } break;
+
+        default: {
+            /* Generic fallback through the unified entry point. Build a best-effort input. */
+            BmsDecodeInput in = {0};
+            in.family = fam_from_code(t->battery_type_code);
+            switch (in.family) {
+                case BMS_FAM_HYP500:
+                    in.u.hyp500.hw_fault       = t->bms_fault_raw;
+                    in.u.hyp500.error_severity = t->last_error_class;
+                    in.u.hyp500.error_code     = t->last_error_code;
+                    break;
+                case BMS_FAM_BMZ500:
+                case BMS_FAM_CP600:
+                    in.u.bmz_cp600.pack_fault  = t->bms_fault_raw;
+                    break;
+                case BMS_FAM_CP400_CHILL:
+                case BMS_FAM_CP400_DUAL: {
+                    BmsCp400Input c = {0};
+                    if (t->last_error_class) c.master_fault_code = t->last_error_class;
+                    else if (t->bms_fault)   c.master_fault_code = 2;
+                    else                      c.master_fault_code = 0;
+                    in.u.cp400 = c;
+                    break;
+                }
+                default:
+                    break;
+            }
+            bms_decode_any(&in, out_text, out_len, &sev, &dom);
+        } break;
+    }
+
+    if (out_sev) *out_sev = sev;
+
+    if (out_text[0] == '\0') {
+        strncpy(out_text, "None", out_len - 1);
+        out_text[out_len - 1] = '\0';
+    }
+}
 
 static QState Ctl_initial (ControllerAO *me, void const *e);
 static QState Ctl_run     (ControllerAO *me, QEvt const *e);
 static QState Ctl_wait    (ControllerAO *me, QEvt const *e);
 static QState Ctl_detect  (ControllerAO *me, QEvt const *e);
 static QState Ctl_charge  (ControllerAO *me, QEvt const *e);
-
+static QState Ctl_poweringDown(ControllerAO * me, QEvt const * e);
 static ControllerAO l_ctl;
 QActive *AO_Controller = &l_ctl.super;
 
@@ -99,34 +223,94 @@ static inline bool ui_ok_now_det(void) {
     if ((now - s_last_det_ms) < 250U) return false;  // ~4 Hz max
     s_last_det_ms = now; return true;
 }
-static char const *bms_state_str(uint16_t st) {
-    switch (st) {
-    case 0:  return "Idle";
-    case 1:  return "Charge";
-    case 2:  return "Discharge";
-        // ... add your real states here ...
-    default: return "Unknown";
-    }
-}
 static void make_summary(NextionSummaryEvt *se, const BmsTelemetry *t) {
     // pack voltage
     se->packV = t->array_voltage_V;
 
-    // battery type string + color (your mapping)
+    // pass through numeric code for HMI color mapping
+    se->battery_type_code = t->battery_type_code ? t->battery_type_code : 0x0000;
+
+    // friendly name + a fallback color (RGB565) in case you still use typeColor565
     switch (t->battery_type_code) {
-    case 0x0400: strcpy(se->battTypeStr, "400s");   se->typeColor565 = 2016;  break;   // green
-    case 0x0500: strcpy(se->battTypeStr, "500s");   se->typeColor565 = 65504; break;   // yellow
-    case 0x0600: strcpy(se->battTypeStr, "600s");   se->typeColor565 = 1023;  break;   // blue
-    default:     strcpy(se->battTypeStr, "Unknown");se->typeColor565 = 63488; break;   // red
+        case 0x0600: // 600s family (Ocado extended)
+            strcpy(se->battTypeStr, "600s");
+            se->typeColor565 = 0xFD20; // orange
+            break;
+
+        case 0x0500: // 500s Hyperdrive (J1939)
+            strcpy(se->battTypeStr, "500s Hyperdrive");
+            se->typeColor565 = 0xFFE0; // yellow
+            break;
+
+        case 0x0501: // 500s BMZ (extended)
+            strcpy(se->battTypeStr, "500s BMZ");
+            se->typeColor565 = 0xFD20; // orange (or pick a distinct amber if you prefer)
+            break;
+
+        case 0x0401: // 400s Dual-Zone
+            strcpy(se->battTypeStr, "400s Dual-Zone");
+            se->typeColor565 = 0x07FF; // teal/cyan
+            break;
+
+        case 0x0402: // 400s Steatite
+            strcpy(se->battTypeStr, "400s Steatite");
+            se->typeColor565 = 0x001F; // blue
+            break;
+
+        case 0x0400: // 400s Hyperdrive (base)
+            strcpy(se->battTypeStr, "400s Hyperdrive");
+            se->typeColor565 = 0x07E0; // green
+            break;
+
+        default:
+            strcpy(se->battTypeStr, "Unknown");
+            se->typeColor565 = 0xC618; // neutral grey
+            break;
     }
 
     // status text
-    strcpy(se->statusStr, bms_state_str(t->bms_state));
+    strncpy(se->statusStr,
+        BMS_state_to_text(t->battery_type_code, t->bms_state),
+        sizeof(se->statusStr)-1);
+    se->statusStr[sizeof(se->statusStr)-1] = '\0';
+
+#if !defined(ENABLE_BMS_SIM)
+    {
+        BattClassResult cr = batt_classify(t, /*bms_sim_active=*/false);
+        strncpy(se->classStr, cr.label, sizeof(se->classStr) - 1);
+        se->classStr[sizeof(se->classStr) - 1] = '\0';
+        se->classColor565 = cr.color565;
+        /* RGB565: 0xFC00 ≈ (255,128,0) — vivid orange */
+        if ((cr.cls == BATT_CLASS_RECOVERABLE) ||
+            (strcmp(cr.label, "Recoverable") == 0)) {
+            se->classColor565 = 0xFC00;
+            }
+    }
+
+#else
+{
+    // SIM build – don’t classify
+    strcpy(se->classStr, "SIMULATOR");
+    se->classColor565 = 0xC618; // grey
+}
+#endif
 
     // errors/warnings (you only have bms_fault bitfield right now)
-    se->errors[0]   = '\0';
-    se->warnIcon    = (t->bms_fault != 0U) ? 1U : 0U;
-    se->recoverable = 0U;         // you don't have a recoverable bit yet
+    char faults[128];
+    BmsSeverity sev;
+    decode_faults_for_ui(t, faults, sizeof(faults), &sev);
+
+    // Put the text into the one-line errors field for pMain.
+    // Keep it short if you want: you can clip or pick the first item.
+    if (strcmp(faults, "None") == 0) {
+        se->errors[0] = '\0';              // Nextion code prints "None" itself
+        se->warnIcon  = 0U;
+    } else {
+        strncpy(se->errors, faults, sizeof(se->errors)-1);
+        se->errors[sizeof(se->errors)-1] = '\0';
+        se->warnIcon = (sev >= BMS_SEV_WARNING) ? 1U : 0U;
+    }
+    se->recoverable = (t->bms_fault == 0U) ? 1U : 0U;         // you don't have a recoverable bit yet
     se->charging    = 0U;         // caller sets this if needed
     se->statusColor565 = 0U;      // leave 0 if you don’t tint the status label
     se->reason[0] = '\0';
@@ -134,8 +318,10 @@ static void make_summary(NextionSummaryEvt *se, const BmsTelemetry *t) {
 
 static void make_details(NextionDetailsEvt *de, const BmsTelemetry *t) {
     // Voltages
-    de->high_voltage_V = t->high_cell_V;
-    de->low_voltage_V  = t->low_cell_V;
+    if (t->high_cell_V >= 2.0f && t->high_cell_V <= 4.6f)
+        de->high_voltage_V = t->high_cell_V;
+    if (t->low_cell_V >= 2.0f && t->low_cell_V <= 4.6f)
+        de->low_voltage_V  = t->low_cell_V;
     // For "avg", we don't have per-cell average; use array voltage as a coarse overall indicator
     de->avg_voltage_V  = t->array_voltage_V;
 
@@ -155,16 +341,25 @@ static void make_details(NextionDetailsEvt *de, const BmsTelemetry *t) {
     de->soc2_percent  = t->soc_percent; // you don't have a second SoC; mirror main SoC
 
     // State + Fault text
-    strcpy(de->bms_state_str, bms_state_str(t->bms_state));
+    strncpy(de->bms_state_str,
+        BMS_state_to_text(t->battery_type_code, t->bms_state),
+        sizeof(de->bms_state_str)-1);
+    de->bms_state_str[sizeof(de->bms_state_str)-1] = '\0';
+
     if (t->bms_fault == 0U) {
         strcpy(de->bms_fault_str, "None");
     } else {
+        char reasons[128];
+        BmsSeverity sev;
+        decode_faults_for_ui(t, reasons, sizeof(reasons), &sev);
+        strncpy(de->bms_fault_str, reasons, sizeof(de->bms_fault_str)-1);
+        de->bms_fault_str[sizeof(de->bms_fault_str)-1] = '\0';
         snprintf(de->bms_fault_str, sizeof(de->bms_fault_str), "0x%02X", t->bms_fault);
     }
     printf("CTL: posting details to HMI\n");
 }
 
-// Build & send compact summary only if it changed
+/* Build & send compact summary only if it changed  */
 static void post_summary(ControllerAO *me, bool charging, char const *reason) {
     if (!ui_ok_now_sum()) return;
 
@@ -182,7 +377,7 @@ static void post_summary(ControllerAO *me, bool charging, char const *reason) {
         se->reason[0] = '\0';
     }
     // UI is non-critical → use margin=1 and GC if it can’t be posted right now
-    if (!QACTIVE_POST_X(AO_Nextion, &se->super, 1U, &me->super)) {
+    if (!QACTIVE_POST_X(AO_Nextion, &se->super, QF_NO_MARGIN, &me->super)) {
         QF_gc(&se->super);
     }
 }
@@ -196,27 +391,153 @@ static void post_details(ControllerAO *me) {
 
     NextionDetailsEvt *de = Q_NEW(NextionDetailsEvt, NEX_REQ_UPDATE_DETAILS_SIG);
     make_details(de, &me->last);
-    if (!QACTIVE_POST_X(AO_Nextion, &de->super, 1U, &me->super)) {
+    if (!QACTIVE_POST_X(AO_Nextion, &de->super, QF_NO_MARGIN, &me->super)) {
         QF_gc(&de->super);
     }
 }
-static void post_page(uint8_t page) {
-    NextionPageEvt *pg = Q_NEW(NextionPageEvt, NEX_REQ_SHOW_PAGE_SIG);
-    pg->page = page;
-    if (!QACTIVE_POST_X(AO_Nextion, &pg->super, 1U, 0U)) {
-        QF_gc(&pg->super);
+
+// --- FORCE versions: ignore rate limits & de-dupe hashes ---
+static void post_summary_force(ControllerAO *me, bool charging, char const *reason) {
+    // build (no ui_ok_now_sum, no hash compare)
+    NextionSummaryEvt *se = Q_NEW(NextionSummaryEvt, NEX_REQ_UPDATE_SUMMARY_SIG);
+    make_summary(se, &me->last);
+    se->charging = charging ? 1U : 0U;
+    if (reason && reason[0]) {
+        strncpy(se->reason, reason, sizeof(se->reason)-1);
+        se->reason[sizeof(se->reason)-1] = '\0';
+    } else {
+        se->reason[0] = '\0';
+    }
+    if (!QACTIVE_POST_X(AO_Nextion, &se->super, QF_NO_MARGIN, &me->super)) {
+        QF_gc(&se->super);
     }
 }
 
+static void post_details_force(ControllerAO *me) {
+    NextionDetailsEvt *de = Q_NEW(NextionDetailsEvt, NEX_REQ_UPDATE_DETAILS_SIG);
+    make_details(de, &me->last);
+    if (!QACTIVE_POST_X(AO_Nextion, &de->super, QF_NO_MARGIN, &me->super)) {
+        QF_gc(&de->super);
+    }
+}
 
+// --- HMI: PSU widget helper (same style as post_summary/post_details) ---
+static void post_psu_to_hmi(uint8_t present, uint8_t output_on,
+                            float v_out, float i_out, float temp_C) {
+    NextionPsuEvt *pe = Q_NEW(NextionPsuEvt, NEX_REQ_UPDATE_PSU_SIG);
+    pe->present   = present;
+    pe->output_on = output_on;   // matches NextionPsuEvt field name
+    pe->v_out     = v_out;
+    pe->i_out     = i_out;
+    pe->temp_C    = temp_C;
+
+    if (!QACTIVE_POST_X(AO_Nextion, &pe->super, QF_NO_MARGIN, 0U)) {
+        QF_gc(&pe->super);
+    }
+}
+
+static bool in_charge;
+
+// static void post_page_ex(ControllerAO *me, uint8_t page) {
+//
+//     me->page = page;
+//
+//     // tell Nextion to change page
+//     NextionPageEvt *pg = Q_NEW(NextionPageEvt, NEX_REQ_SHOW_PAGE_SIG);
+//     pg->page = page;
+//     if (!QACTIVE_POST_X(AO_Nextion, &pg->super, QF_NO_MARGIN, 0U)) {
+//         QF_gc(&pg->super);
+//     }
+//
+//     // force next UI publish to repaint (reset de-dupe hashes)
+//     s_last_sum_hash = 0U;
+//     s_last_det_hash = 0U;
+//
+//     // repaint immediately if we already have data
+//     if (me->haveData) {
+//         if (page == 2U) {               // pMain
+//             post_summary_force(me, (me->state == CTL_STATE_CHARGE || me->state==CTL_STATE_DETECT), NULL);
+//             post_psu_to_hmi(me->psu_present, me->psu_out_on,
+//                         me->psu_v_out, me->psu_i_out, me->psu_temp);
+//             //post_summary(me, (me->state == CTL_STATE_CHARGE || me->state==CTL_STATE_DETECT), NULL);
+//         } else if (page == 3U) {        // pDetails
+//             post_details(me);
+//             post_details_force(me);
+//         }
+//     }
+// }
+static void post_page_ex(ControllerAO *me, uint8_t page) {
+    // keep our own notion of the current page in sync
+    me->page = page;
+
+    // tell Nextion to change page
+    NextionPageEvt *pg = Q_NEW(NextionPageEvt, NEX_REQ_SHOW_PAGE_SIG);
+    pg->page = page;
+    if (!QACTIVE_POST_X(AO_Nextion, &pg->super, QF_NO_MARGIN, 0U)) {
+        QF_gc(&pg->super);
+    }
+
+    // force next UI publish to repaint (reset de-dupe hashes)
+    s_last_sum_hash = 0U;
+    s_last_det_hash = 0U;
+
+    // repaint immediately if we already have data
+    if (me->haveData) {
+        if (page == 2U) {    // pMain
+            post_summary_force(me,
+                (me->state == CTL_STATE_CHARGE || me->state == CTL_STATE_DETECT),
+                NULL);
+            // also push last-known PSU snapshot right away
+            post_psu_to_hmi(me->psu_present, me->psu_out_on,
+                            me->psu_v_out, me->psu_i_out, me->psu_temp);
+        } else if (page == 3U) {   // pDetails
+            post_details_force(me);
+        }
+    }
+}
+
+static void post_comms_lost(ControllerAO *me) {
+    // Build a normal summary, then override just what we need.
+    NextionSummaryEvt *se = Q_NEW(NextionSummaryEvt, NEX_REQ_UPDATE_SUMMARY_SIG);
+    make_summary(se, &me->last);
+
+    strncpy(se->classStr, "Comms Lost with the Battery!", sizeof(se->classStr)-1);
+    se->classStr[sizeof(se->classStr)-1] = '\0';
+
+    strncpy(se->reason, "Check the connection with the Battery!", sizeof(se->reason)-1);
+    se->reason[sizeof(se->reason)-1] = '\0';
+
+    se->warnIcon = 1U;        // turn the warning icon ON
+    se->charging = 0U;        // not charging
+
+    if (!QACTIVE_POST_X(AO_Nextion, &se->super, QF_NO_MARGIN, &me->super)) {
+        QF_gc(&se->super);
+    }
+}
+
+// static inline void bms_watch_kick(ControllerAO *me, QTimeEvtCtr ticks) {
+//     /* If it was already armed, rearm updates its timeout safely.
+//        If it wasn't armed, re-arm returns false → do a fresh armX. */
+//     if (!QTimeEvt_rearm(&me->tBmsWatch, ticks)) {
+//         QTimeEvt_armX(&me->tBmsWatch, ticks, 0U);
+//     }
+// }
+//
+// static inline void psuoff_start(ControllerAO *me, QTimeEvtCtr ticks){
+//     if (!QTimeEvt_rearm(&me->tPsuOff, ticks)) {
+//         QTimeEvt_armX(&me->tPsuOff, ticks, 0U);
+//     }
+// }
 /* ctor */
 void ControllerAO_ctor(void) {
 #ifdef ENABLE_BMS_SIM
     QTimeEvt_ctorX(&l_ctl.simTick, &l_ctl.super, SIM_TICK_SIG, 0U);
 #endif
     QActive_ctor(&l_ctl.super, Q_STATE_CAST(&Ctl_initial));
+    QTimeEvt_ctorX(&l_ctl.tBmsWatch, &l_ctl.super, BMS_WATCHDOG_TO_SIG, 0U);
     QTimeEvt_ctorX(&l_ctl.ui2s,   &l_ctl.super, TIMEOUT_SIG, 0U);
-    QTimeEvt_ctorX(&l_ctl.tCharge,&l_ctl.super, PSU_RSP_STATUS_SIG/*reuse*/, 0U);
+    QTimeEvt_ctorX(&l_ctl.tCharge, &l_ctl.super, CHARGE_TIMEOUT_SIG, 0U);
+    QTimeEvt_ctorX(&l_ctl.tPsuOff, &l_ctl.super, PSU_OFF_WAIT_TO_SIG, 0U);
 }
 
 /* states */
@@ -225,14 +546,17 @@ static QState Ctl_initial(ControllerAO * const me, void const *const e) {
     me->page     = 1U;   // start at pWait after splash
     me->haveData = 0U;
     memset(&me->last, 0, sizeof(me->last));
-
+    me->psu_present = 0U;
+    me->psu_out_on  = 0U;
+    me->psu_v_out   = 0.0f;
+    me->psu_i_out   = 0.0f;
+    me->psu_temp    = 0.0f;
+    //QTimeEvt_disarm(&me->tBmsWatch);
     /* subscribe AFTER we’re started */
     QActive_subscribe(&me->super, BMS_UPDATED_SIG);
     QActive_subscribe(&me->super, BMS_NO_BATTERY_SIG);
     QActive_subscribe(&me->super, BMS_CONN_LOST_SIG);
 
-    /* small splash delay then go RUN */
-    QTimeEvt_armX(&me->ui2s, BSP_TICKS_PER_SEC/2U, 0U);
 #ifdef ENABLE_BMS_SIM
     // every 500 ms (adjust as you like)
     QTimeEvt_armX(&me->simTick, BSP_TICKS_PER_SEC/2, BSP_TICKS_PER_SEC/2);
@@ -262,17 +586,33 @@ static QState Ctl_run(ControllerAO * const me, QEvt const * const e) {
     case NEX_READY_SIG: {
         // Nextion finished its own init/splash; decide first page:
         if (me->haveData) {
-            post_page(2);                     // pMain
+            post_page_ex(me, 2);                     // pMain
             post_summary(me, false, "ready to charge");
             post_details(me);
             printf("CTL: NEX_READY\r\n");
             return Q_TRAN(&Ctl_detect);
         } else {
-            post_page(1);                     // pWait
+            post_page_ex(me, 1);                     // pWait
             return Q_TRAN(&Ctl_wait);
         }
     }
+    case PSU_RSP_STATUS_SIG: {
+        CotekStatusEvt const *se = (CotekStatusEvt const *)e;
 
+        // cache
+        me->psu_present = se->present;
+        me->psu_out_on  = se->out_on ? 1U : 0U;
+        me->psu_v_out   = se->v_out;
+        me->psu_i_out   = se->i_out;
+        me->psu_temp    = se->t_out;
+
+        // if we're on pMain, repaint immediately
+        if (me->page == 2U) {
+            post_psu_to_hmi(me->psu_present, me->psu_out_on,
+                            me->psu_v_out, me->psu_i_out, me->psu_temp);
+        }
+        return Q_HANDLED();
+    }
     case BMS_UPDATED_SIG: {
             BmsTelemetryEvt const *be = Q_EVT_CAST(BmsTelemetryEvt);
             me->haveData = 1U;
@@ -281,7 +621,8 @@ static QState Ctl_run(ControllerAO * const me, QEvt const * const e) {
             // page transition like you have
             if (me->page == 1U) { // pWait -> pMain
                 me->page = 2U;
-                post_page(2U);
+                post_page_ex(me, 2U);
+
             }
 
             // Always refresh pMain summary when on pMain
@@ -289,17 +630,35 @@ static QState Ctl_run(ControllerAO * const me, QEvt const * const e) {
                 post_summary(me, /*charging?*/ false, "BMS updated");
                 post_details(me);
             }
-
-            return Q_HANDLED();
+            // we saw fresh BMS data -> (re)start watchdog for ~1.5s
+        //last_bms_ms = HAL_GetTick();
+        //bms_watch_kick(me, 150U);
+        return Q_HANDLED();
     }
+    // case BMS_WATCHDOG_TO_SIG: {
+    //     printf("CTL: BMS watchdog fired1 → comms lost\n");
+    //     // No frames for the window → treat as comms lost
+    //     me->haveData = 0U;
+    //
+    //     if (me->page == 3U) {
+    //         post_page_ex(me, 2U);   // force pMain
+    //     }
+    //     if (me->page == 2U) {
+    //         post_comms_lost(me);    // banner + pWarn ON
+    //     }
+    //     printf("CTL: BMS watchdog fired2 → comms lost\n");
+    //     // Optionally turn PSU OFF or leave that to charge-state only.
+    //     return Q_HANDLED();
+    //     }
     case TIMEOUT_SIG: {
-            if (me->page == 3U) {      // pDetails
-                    post_details(me);
-            } else if (me->page == 2U) {
-                    post_summary(me, false, 0);
-            }
-            QTimeEvt_armX(&me->ui2s, BSP_TICKS_PER_SEC/2U, 0U);
-            return Q_HANDLED();
+        if (!me->haveData) { return Q_HANDLED(); }  // nothing fresh → don’t overwrite banner
+
+        if (me->page == 3U) {
+            post_details(me);
+        } else if (me->page == 2U) {
+            post_summary(me, false, 0);
+        }
+        return Q_HANDLED();
     }
     case BUTTON_PRESSED_SIG: {
         /* Only act if we have a battery detected */
@@ -308,7 +667,55 @@ static QState Ctl_run(ControllerAO * const me, QEvt const * const e) {
         }
         return Q_HANDLED();
         }
-        default: break;
+    case NEX_REQ_SHOW_PAGE_SIG: {  // coming FROM Nextion via Nextion_OnRx()
+        NextionPageEvt const *pe = (NextionPageEvt const*)e;
+        me->page = pe->page;
+        s_last_sum_hash = 0U; s_last_det_hash = 0U;   // force repaint
+        if (me->haveData) {
+            if (me->page == 2U) {
+                post_summary_force(me,
+                    (me->state==CTL_STATE_CHARGE || me->state==CTL_STATE_DETECT), "");
+                post_psu_to_hmi(me->psu_present, me->psu_out_on,
+                                me->psu_v_out, me->psu_i_out, me->psu_temp);
+            } else if (me->page == 3U) {
+                post_details_force(me);
+            }
+        }
+        return Q_HANDLED();
+        }
+    case BMS_CONN_LOST_SIG: {
+        me->haveData = 0U;
+
+        // If user is on pDetails, switch to pMain
+        if (me->page == 3U) {
+            post_page_ex(me, 2U);   // pMain
+        }
+
+        // If user is on pMain, or we just switched to it, post comms-lost banner
+        if (me->page == 2U) {
+            post_comms_lost(me);
+        }
+
+        /* 1) ask PSU to turn OFF */
+        QEvt *off = Q_NEW(QEvt, PSU_REQ_OFF_SIG);
+        // UI/PSU requests are “best effort”: use margin 0U and GC if it can’t be queued right now
+        if (!QACTIVE_POST_X(AO_Cotek, off, QF_NO_MARGIN, 0U)) {
+            QF_gc(off);
+        }
+        /* 2) start short timeout (e.g., 500 ms) as a guard */
+        QTimeEvt_armX(&me->tPsuOff, 50U, 0U);   /* assuming your tick is 10ms */
+        /* 3) go wait for confirmation */
+        return Q_TRAN(&Ctl_poweringDown);
+        }
+
+    default: {
+            // crude signal tracer to prove path; remove after debugging
+            printf("CTL(run): sig=%u (page=%u, haveData=%u, state=%s)\r\n",
+                   (unsigned)e->sig, (unsigned)me->page, (unsigned)me->haveData,
+                   (me->state == CTL_STATE_DETECT) ? "detect" :
+                   (me->state == CTL_STATE_CHARGE) ? "charge" : "wait");
+            break;
+    }
     }
     return Q_SUPER(&QHsm_top);
 }
@@ -316,6 +723,11 @@ static QState Ctl_run(ControllerAO * const me, QEvt const * const e) {
 /* -------- WAIT FOR BATTERY -------- */
 static QState Ctl_wait(ControllerAO * const me, QEvt const * const e) {
     switch (e->sig) {
+    // case Q_ENTRY_SIG:
+    //     {
+    //         //printf("Ctl_wait: entry\r\n");
+    //         //me->state = CTL_STATE_WAIT;
+    //     }
     case BMS_UPDATED_SIG: {
             BmsTelemetryEvt const *be = Q_EVT_CAST(BmsTelemetryEvt);
             me->haveData = 1U;
@@ -324,20 +736,25 @@ static QState Ctl_wait(ControllerAO * const me, QEvt const * const e) {
             // page transition like you have
             if (me->page == 1U) { // pWait -> pMain
                 me->page = 2U;
-                post_page(2U);
+                post_page_ex(me, 2U);
+
             }
 
             // Always refresh pMain summary when on pMain
             if (me->page == 2U) {
                 post_summary(me, /*charging?*/ false, "BMS updated");
                 post_details(me);
-            }
 
+            }
             return Q_HANDLED();
     }
-    case BMS_NO_BATTERY_SIG:
+    case BMS_NO_BATTERY_SIG: {
+        // QTimeEvt_disarm(&me->tBmsWatch);
+        // return Q_HANDLED();
+    }
     case BMS_CONN_LOST_SIG: {
-        /* keep pWait; nothing else */
+        // QTimeEvt_disarm(&me->tBmsWatch);
+        // printf("CTL: BMS watchdog disarm\n");
         return Q_HANDLED();
     }
         default: ;
@@ -349,8 +766,10 @@ static QState Ctl_wait(ControllerAO * const me, QEvt const * const e) {
 static QState Ctl_detect(ControllerAO * const me, QEvt const * const e) {
     switch (e->sig) {
     case Q_ENTRY_SIG: {
+        me->state = CTL_STATE_DETECT;
+        printf("Ctl_detect -> ENTRY");
         /* 2s UI refresh, in case we want periodic updates anyway */
-        QTimeEvt_armX(&me->ui2s, BSP_TICKS_PER_SEC/2, BSP_TICKS_PER_SEC/2);
+        QTimeEvt_armX(&me->ui2s, BSP_TICKS_PER_SEC*2U, BSP_TICKS_PER_SEC*2U);
         return Q_HANDLED();
     }
     case Q_EXIT_SIG: {
@@ -358,8 +777,20 @@ static QState Ctl_detect(ControllerAO * const me, QEvt const * const e) {
         return Q_HANDLED();
     }
     case TIMEOUT_SIG: { /* periodic UI refresh */
-        post_summary(me, false, "ready to charge");
-        post_details(me);
+        if (!me->haveData) { return Q_HANDLED(); }  // nothing fresh → don’t overwrite banner
+
+        if (me->page == 3U) {
+            post_details(me);
+        } else if (me->page == 2U) {
+            post_summary(me, false, 0);
+        }
+        printf("pMain: V=%.2fV type=0x%04X state=%u soc=%u recoverable=%u reason=\"%s\"\r\n",
+                   (double)me->last.array_voltage_V,
+                   (unsigned)me->last.battery_type_code,
+                   (unsigned)me->last.bms_state,
+                   (unsigned)me->last.soc_percent,
+                   (unsigned)(me->last.bms_fault==0U),
+                   "ready to charge");
         return Q_HANDLED();
     }
     case BMS_UPDATED_SIG: {
@@ -367,16 +798,69 @@ static QState Ctl_detect(ControllerAO * const me, QEvt const * const e) {
         me->last = be->data; me->haveData = 1U;
         post_summary(me, false, "ready to charge");
         post_details(me);
+        // we saw fresh BMS data -> (re)start watchdog for ~1.5s
+        // last_bms_ms = HAL_GetTick();
+        // bms_watch_kick(me, 150U);
+        // printf("CTL: BMS watchdog arm 1500ms\n");
         return Q_HANDLED();
     }
     case BMS_CONN_LOST_SIG: {
         me->haveData = 0U;
-        post_page(1); /* pWait */
-        return Q_TRAN(&Ctl_wait);
+        // If user is on pDetails, switch to pMain
+        if (me->page == 3U) {
+            post_page_ex(me, 2U);   // pMain
+        }
+
+        // If user is on pMain, or we just switched to it, post comms-lost banner
+        if (me->page == 2U) {
+            post_comms_lost(me);
+        }
+        return Q_HANDLED();
     }
 
     case BUTTON_PRESSED_SIG: {
-        return Q_TRAN(&Ctl_charge);
+            printf("Ctl_detect-BTN: PC13 pressed\r\n");  // visibility
+        // Must have data AND it must be fresh (< 1.5s old)
+        uint32_t now = HAL_GetTick();
+        bool fresh = (me->haveData && (now - last_bms_ms) <= 1500U);
+        if (!fresh) {
+            post_comms_lost(me);              // show banner
+            return Q_HANDLED();               // block charging
+        }
+            if (!Cotek_isPresent()) {
+                post_summary(me, false, "PSU not present/error");
+                return Q_HANDLED();
+            }
+            /* allow charge only if we have fresh BMS data AND it’s recoverable */
+#if !defined(ENABLE_BMS_SIM)
+        // === REAL BATTERIES ONLY (no SIM) ===
+        // if (!me->haveData) {
+        //     post_summary(me, false, "No BMS data");
+        //     return Q_HANDLED();
+        // }
+
+        BattClassResult cr = batt_classify(&me->last, /*bms_sim_active=*/false);
+
+        if (cr.cls == BATT_CLASS_NOT_RECOVERABLE) {
+            post_summary(me, false, "Not Recoverable – charging blocked");
+            return Q_HANDLED();
+        } else if (cr.cls == BATT_CLASS_RECOVERABLE || cr.cls == BATT_CLASS_OPERATIONAL) {
+            printf("Ctl_detect transition to Ctl_charge\r\n");
+            return Q_TRAN(&Ctl_charge);
+        } else {
+            post_summary(me, false, "Unknown status – cannot start");
+            return Q_HANDLED();
+        }
+#else
+        // === SIM BUILD === (keep previous behaviour)
+        if (me->haveData) {
+            printf("Ctl_detect transition to Ctl_charge\r\n");
+            return Q_TRAN(&Ctl_charge);
+        } else {
+            post_summary(me, false, "No BMS data");
+            return Q_HANDLED();
+        }
+#endif
     }
 
     default: break;
@@ -388,29 +872,50 @@ static QState Ctl_detect(ControllerAO * const me, QEvt const * const e) {
 static QState Ctl_charge(ControllerAO * const me, QEvt const * const e) {
     switch (e->sig) {
     case Q_ENTRY_SIG: {
-        /* command PSU: 12V, 1A */
-        PsuSetEvt *se = Q_NEW(PsuSetEvt, PSU_REQ_SETPOINT_SIG);
-        se->voltSet = 12.0f;
-        se->currSet = 1.0f;
-            if (!QACTIVE_POST_X(AO_Cotek, &se->super, 1U, 0U)) {
-                QF_gc(&se->super);
-            }
-        post_summary(me, true, "charging");
+        me->state = CTL_STATE_CHARGE;
+        in_charge = true;
+        printf("Ctl_charge: entry\r\n");
+#if !defined(ENABLE_BMS_SIM)
+        // === REAL BATTERIES ONLY ===
+        BattClassResult cr = batt_classify(&me->last, /*bms_sim_active=*/false);
 
-        /* stop after 60s */
-        QTimeEvt_armX(&me->tCharge, 60U*BSP_TICKS_PER_SEC, 0U);
+        float v_set = 48.0f;
+        float i_set = 0.0f;
+
+        if (cr.cls == BATT_CLASS_NOT_RECOVERABLE) {
+            post_summary(me, false, "Blocked: Not Recoverable");
+            return Q_TRAN(&Ctl_detect);  // do not arm timer, do not command PSU
+        } else if (cr.cls == BATT_CLASS_RECOVERABLE) {
+            i_set = 1.0f;  // 48V / 1A
+        } else if (cr.cls == BATT_CLASS_OPERATIONAL) {
+            i_set = 3.0f;  // 48V / 3A
+        } else {
+            post_summary(me, false, "Unknown class – cannot charge");
+            return Q_TRAN(&Ctl_detect);
+        }
+#else
+        // === SIM BUILD === (previous default used in your code)
+        float v_set = 12.0f;
+        float i_set = 1.0f;
+#endif
+
+        printf("CTL: start charging V=%.1f I=%.1f (30s)\r\n", (double)v_set, (double)i_set);
+
+        PsuSetEvt *se = Q_NEW(PsuSetEvt, PSU_REQ_SETPOINT_SIG);
+        se->voltSet = v_set;
+        se->currSet = i_set;
+        if (!QACTIVE_POST_X(AO_Cotek, &se->super, QF_NO_MARGIN, 0U)) {
+            QF_gc(&se->super);
+        }
+        post_summary(me, true, "charging");
+        QTimeEvt_armX(&me->tCharge, 30U * BSP_TICKS_PER_SEC, 0U);
         return Q_HANDLED();
     }
     case Q_EXIT_SIG: {
+        in_charge = false;
+        printf("Ctl_charge: exit\r\n");
         QTimeEvt_disarm(&me->tCharge);
         return Q_HANDLED();
-    }
-    case PSU_RSP_STATUS_SIG: {
-        /* we reused this SIG for timeout above, so treat as timeout here */
-        /* stop PSU and go back to DETECTED */
-        (void)QACTIVE_POST_X(AO_Cotek, Q_NEW(QEvt, PSU_REQ_OFF_SIG), 1U, 0U);
-        post_summary(me, false, "charge complete");
-        return Q_TRAN(&Ctl_detect);
     }
     case BMS_UPDATED_SIG: {
         BmsTelemetryEvt const *be = Q_EVT_CAST(BmsTelemetryEvt);
@@ -418,27 +923,127 @@ static QState Ctl_charge(ControllerAO * const me, QEvt const * const e) {
 
         /* guard: temp < 35C and no new errors */
         if (me->last.sys_temp_high_C > 35.0f || me->last.last_error_class) {
-            (void)QACTIVE_POST_X(AO_Cotek, Q_NEW(QEvt, PSU_REQ_OFF_SIG), 1U, 0U);
+            QEvt *off = Q_NEW(QEvt, PSU_REQ_OFF_SIG);
+            // UI/PSU requests are “best effort”: use margin 0U and GC if it can’t be queued right now
+            if (!QACTIVE_POST_X(AO_Cotek, off, QF_NO_MARGIN, 0U)) {
+                QF_gc(off);
+            }
             post_summary(me, false,
                 (me->last.sys_temp_high_C > 35.0f) ? "Stopped: temp > 35C"
                                                    : "Stopped: new error");
+            printf("Ctl_charge: BMS_UPDATE_SIG - High temp or error detected\r\n");
             return Q_TRAN(&Ctl_detect);
         }
         /* refresh UI while charging */
         post_summary(me, true, "charging");
+        // printf("pMain: CHG V=%.2fV type=0x%04X T=%.1fC soc=%u reason=\"charging\"\r\n",
+        //        (double)me->last.array_voltage_V,
+        //        (unsigned)me->last.battery_type_code,
+        //        (double)me->last.sys_temp_high_C,
+        //        (unsigned)me->last.soc_percent);
+        // we saw fresh BMS data -> (re)start watchdog for ~1.5s
+        // last_bms_ms = HAL_GetTick();
+        // bms_watch_kick(me, 150U);
+        // printf("CTL: BMS watchdog arm 1500ms\n");
         return Q_HANDLED();
     }
     case BMS_CONN_LOST_SIG: {
-        (void)QACTIVE_POST_X(AO_Cotek, Q_NEW(QEvt, PSU_REQ_OFF_SIG), 1U, 0U);
-        post_summary(me, false, "Stopped: BMS lost");
-        return Q_TRAN(&Ctl_wait);
+
+            post_summary(me, false, "Stopped: BMS lost");
+            // ensure page and comms-lost banner + warn icon
+            if (me->page == 3U) { post_page_ex(me, 2U); }
+            post_comms_lost(me);
+            /* 1) ask PSU to turn OFF */
+            QEvt *off = Q_NEW(QEvt, PSU_REQ_OFF_SIG);
+            // UI/PSU requests are “best effort”: use margin 0U and GC if it can’t be queued right now
+            if (!QACTIVE_POST_X(AO_Cotek, off, QF_NO_MARGIN, 0U)) {
+                QF_gc(off);
+            }
+            /* 2) start short timeout (e.g., 500 ms) as a guard */
+            QTimeEvt_armX(&me->tPsuOff, 50U, 0U);   /* assuming your tick is 10ms */
+            /* 3) go wait for confirmation */
+            return Q_TRAN(&Ctl_poweringDown);
     }
-        case BUTTON_PRESSED_SIG:     // or BUTTON_RELEASED_SIG if you prefer
-            (void)QACTIVE_POST_X(AO_Cotek, Q_NEW(QEvt, PSU_REQ_OFF_SIG), 1U, 0U);
-            post_summary(me, false, "Stopped: user");
-            return Q_TRAN(&Ctl_detect);
+    case CHARGE_TIMEOUT_SIG: {
+            printf("Ctl_charge: Charge_timeout_sig\r\n");
+            // Ask PSU to turn OFF, then wait for confirmation in the substate
+            QEvt *off = Q_NEW(QEvt, PSU_REQ_OFF_SIG);
+            if (!QACTIVE_POST_X(AO_Cotek, off, QF_NO_MARGIN, 0U)) {
+                QF_gc(off);
+            }
+            post_summary(me, false, "Stopped: 30s timeout");
+            return Q_TRAN(&Ctl_poweringDown);
+    }
+    case BUTTON_PRESSED_SIG:     // or BUTTON_RELEASED_SIG if you prefer
+
+        post_summary(me, false, "Stopped: user");
+        /* 1) ask PSU to turn OFF */
+        QEvt *off = Q_NEW(QEvt, PSU_REQ_OFF_SIG);
+        // UI/PSU requests are “best effort”: use margin 0U and GC if it can’t be queued right now
+        if (!QACTIVE_POST_X(AO_Cotek, off, QF_NO_MARGIN, 0U)) {
+            QF_gc(off);
+        }
+        /* 3) go wait for confirmation */
+        return Q_TRAN(&Ctl_poweringDown);
 
         default: break;
     }
     return Q_SUPER(&Ctl_run);
+}
+
+/* -------- PSU OUTPUT OFF -------- */
+static QState Ctl_poweringDown(ControllerAO * const me, QEvt const * const e) {
+    switch (e->sig) {
+    case Q_ENTRY_SIG: {
+            // Ask PSU to turn OFF
+            QEvt *off = Q_NEW(QEvt, PSU_REQ_OFF_SIG);
+            // UI/PSU requests are “best effort”: use margin 0U and GC if it can’t be queued right now
+            if (!QACTIVE_POST_X(AO_Cotek, off, 1U, 0U)) {
+                QF_gc(off);
+            }
+
+            // Start a short watchdog while waiting for confirmation.
+            // 200ms is typical; tune as you like.
+            QTimeEvt_armX(&me->tPsuOff, BSP_TICKS_PER_SEC / 5U, 0U);
+            // psuoff_start(me,20U);
+            // Optional: tell UI we’re stopping (don’t say OFF yet)
+            post_summary(me, false, "stopping...");
+            return Q_HANDLED();
+    }
+
+    case PSU_RSP_STATUS_SIG: {
+            // Check the status “output disabled?”
+            CotekStatusEvt const *se = (CotekStatusEvt const *)e;
+            bool output_is_on = false;
+
+            output_is_on = (se->out_on != 0U);
+
+            if (!output_is_on) {
+                // OFF confirmed → now safe to say OFF and leave the substate
+                /* cancel the wait timer */
+                post_psu_to_hmi(/*present=*/1U, /*output_on=*/0U,
+                se->v_out, se->i_out, se->t_out);
+                QTimeEvt_disarm(&me->tPsuOff);
+                post_summary(me, false, "power off confirmed");
+                return Q_TRAN(&Ctl_detect);
+            }
+
+            // Still ON; keep waiting.
+            return Q_HANDLED();
+    }
+
+    case PSU_OFF_WAIT_TO_SIG: {
+            // Didn’t see OFF yet; re-issue OFF and keep waiting.
+            (void)QACTIVE_POST_X(AO_Cotek, Q_NEW(QEvt, PSU_REQ_OFF_SIG), 1U, 0U);
+            QTimeEvt_rearm(&me->tPsuOff, BSP_TICKS_PER_SEC / 5U);
+            return Q_HANDLED();
+    }
+
+    case Q_EXIT_SIG: {
+            // Stop the watchdog timer cleanly
+            QTimeEvt_disarm(&me->tPsuOff);
+            return Q_HANDLED();
+    }
+    }
+    return Q_SUPER(&Ctl_run);  // or your actual superstate
 }

@@ -84,7 +84,13 @@ if (EXISTS "${QPC_DIR}/ports/arm-cm/qv/gnu/qv_port.c")
 endif()
 
 add_executable(CotekCLion.elf ${APP_SOURCES} ${STARTUP_FILE}
-        Core/Inc/qpc_cfg.h)
+        Core/Inc/qpc_cfg.h
+        Core/Inc/batt_classify.h
+        Core/Src/batt_classify.c
+        Core/Inc/can_proto.h
+        Core/Src/bsut.c
+        Core/Src/bms_fault_decode.c
+)
 
 # --- Include paths ---
 target_include_directories(CotekCLion.elf PRIVATE
@@ -102,7 +108,7 @@ target_compile_definitions(CotekCLion.elf PRIVATE
         USE_HAL_DRIVER
         STM32F103xB
         QF_BASEPRI=0x50  # 0x50 >> (8-4) = 5
-        ENABLE_BMS_SIM
+        #ENABLE_BMS_SIM
         $<$<CONFIG:Debug>:DEBUG>
 )
 

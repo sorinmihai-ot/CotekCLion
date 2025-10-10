@@ -49,7 +49,22 @@ typedef struct {
     uint8_t present;
     uint8_t out_on;
     float   v_out, i_out, t_out;
+    /* --- startup policy --- */
+    uint8_t startup_sync;   /* 1 = we are confirming OFF at boot */
+    uint8_t off_acks;       /* consecutive reads showing output OFF */
 } CotekAO;
+
+static void publish_status(CotekAO *me) {
+    CotekStatusEvt *se = Q_NEW(CotekStatusEvt, PSU_RSP_STATUS_SIG);
+    se->present = me->present;
+    se->out_on  = me->out_on;   /* 1=ON, 0=OFF to match your struct */
+    se->v_out   = me->v_out;
+    se->i_out   = me->i_out;
+    se->t_out  = me->t_out;
+    if (!QACTIVE_POST_X(AO_Controller, &se->super, 0U, &me->super)) {
+        QF_gc(&se->super);
+    }
+}
 
 //helper to send the Cotek data to the HMI screen
 static void post_psu(const CotekAO *me,
@@ -63,7 +78,7 @@ static void post_psu(const CotekAO *me,
     pe->v_out     = v_out;
     pe->i_out     = i_out;
     pe->temp_C    = temp_C;
-    if (!QACTIVE_POST_X(AO_Nextion, &pe->super, 1U, &me->super)) {
+    if (!QACTIVE_POST_X(AO_Nextion, &pe->super, 0U, &me->super)) {
         QF_gc(&pe->super);
     }
 }
@@ -78,6 +93,38 @@ QActive *AO_Cotek = &l_psu.super;
 void CotekAO_ctor(void) {
     QActive_ctor(&l_psu.super, Q_STATE_CAST(&Cotek_initial));
 }
+static uint8_t cotek_read_control(uint8_t *ctrl) {
+    uint8_t reg = 0x7C;
+    if (HAL_I2C_Master_Transmit(&hi2c1, COTEK_I2C_ADDR, &reg, 1, I2C_TIMEOUT_MS) != HAL_OK) {
+        return 0U;
+    }
+    if (HAL_I2C_Master_Receive(&hi2c1, COTEK_I2C_ADDR, rx_data, 1, I2C_TIMEOUT_MS) != HAL_OK) {
+        return 0U;
+    }
+    *ctrl = rx_data[0];
+    return 1U;
+}
+static uint8_t i2c_read_u16(uint8_t reg, uint16_t *out) {
+    *out = 0;
+    if (HAL_I2C_Master_Transmit(&hi2c1, COTEK_I2C_ADDR, &reg, 1, I2C_TIMEOUT_MS) != HAL_OK) {
+        return 0U;
+    }
+    if (HAL_I2C_Master_Receive(&hi2c1, COTEK_I2C_ADDR, rx_data, 2, I2C_TIMEOUT_MS) != HAL_OK) {
+        return 0U;
+    }
+    *out = (uint16_t)((rx_data[1] << 8) | rx_data[0]);
+    return 1U;
+}
+static uint8_t i2c_read_u8(uint8_t reg, uint8_t *out) {
+    if (HAL_I2C_Master_Transmit(&hi2c1, COTEK_I2C_ADDR, &reg, 1, I2C_TIMEOUT_MS) != HAL_OK) {
+        return 0U;
+    }
+    if (HAL_I2C_Master_Receive(&hi2c1, COTEK_I2C_ADDR, rx_data, 1, I2C_TIMEOUT_MS) != HAL_OK) {
+        return 0U;
+    }
+    *out = rx_data[0];
+    return 1U;
+}
 
 static QState Cotek_initial(CotekAO * const me, void const *par) {
     (void)par;
@@ -85,78 +132,108 @@ static QState Cotek_initial(CotekAO * const me, void const *par) {
     cotek_power_off();
     me->on = 0U; me->vset = 0.f; me->iset = 0.f;
     QTimeEvt_ctorX(&me->tick, &me->super, COTEK_TICK_SIG, 0U);
-    // start periodic every 200ms
+    // start periodic every 500ms
     QTimeEvt_armX(&me->tick, 50U, 50U); // assuming 1 tick = 10 ms (adjust to your BSP tick)
     me->alive_ms = 1000U;   // start as stale
     me->present = 0U;
     me->out_on  = 0U;
     me->v_out = me->i_out = me->t_out = 0.0f;
+    /* start in "startup sync": confirm real OFF before we publish “OFF” */
+    me->startup_sync = 1U;
+    me->off_acks     = 0U;
     return Q_TRAN(&Cotek_active);
 }
 
-static QState Cotek_active(CotekAO * const me, QEvt const * const e) {
-    switch (e->sig) {
-    case COTEK_TICK_SIG: {
-            float v = cotek_read_voltage();      // your existing function
-            float i = cotek_read_current();      // your existing function
-            float t = cotek_read_temperature();  // your existing function
-            // non-blocking poll: start/advance one small read each tick
-            // e.g., issue one command here; return immediately
-            // If reads succeeded, consider the PSU "alive".
-            // (If you can detect I2C error, gate this with that.)
-            me->alive_ms = 0U;
+static QState Cotek_active(CotekAO * const me, QEvt const * const e)
+{
+    switch (e->sig)
+    {
+            case COTEK_TICK_SIG: {
+                uint16_t rawV = 0, rawI = 0;   uint8_t rawT = 0, ctrl = 0;
+                uint8_t okV = i2c_read_u16(0x60, &rawV);          // V*100
+                uint8_t okI = i2c_read_u16(0x62, &rawI);          // A*100
+                uint8_t okT = i2c_read_u8 (0x68, &rawT);          // °C
+                uint8_t okC = cotek_read_control(&ctrl);          // bit0=ON
 
-            // Update last-known readings (for UI)
-            me->v_out = v;
-            me->i_out = i;
-            me->t_out = t;
+                uint8_t okAny = (okV || okI || okT || okC);
+                if (okAny) {
+                    me->alive_ms = 0U;
+                    if (okV) me->v_out = (float)rawV / 100.0f;
+                    if (okI) me->i_out = (float)rawI / 100.0f;
+                    if (okT) me->t_out = (float)rawT;
+                    if (okC) me->out_on = ((ctrl & 0x01U) != 0U);  // bit0 = output enable
+                } else {
+                    if (me->alive_ms < 5000U) { me->alive_ms += 200U; } // 200 ms tick
+                }
+                uint8_t new_present = (me->alive_ms <= 1000U) ? 1U : 0U;
+                me->present = new_present;
 
-            // For now, infer output ON/OFF from your AO state (or wire to real status if you have it)
-            me->out_on = (me->on != 0U);
+                static uint8_t last_present = 0xFFU, last_out_on = 0xFFU;
+                static float   last_v = -999.0f, last_i = -999.0f, last_t = -999.0f;
 
-            // ---- 2) age the "alive" timer & compute presence ----
-            // Tick period ~200ms; cap at a few seconds
-            if (me->alive_ms < 5000U) {
-                me->alive_ms += 200U;
-            }
-            uint8_t new_present = (me->alive_ms <= 1000U) ? 1U : 0U;
+                if (   (new_present != last_present)
+                    || (me->out_on   != last_out_on)
+                    || (fabsf(last_v - me->v_out) > 0.05f)
+                    || (fabsf(last_i - me->i_out) > 0.05f)
+                    || (fabsf(last_t - me->t_out) > 0.5f)) {
 
-            // ---- 3) publish only if something visible changed ----
-            static uint8_t last_present = 0xFFU;  // force first publish
-            static uint8_t last_out_on;
-            static float last_v, last_i, last_t;
+                    last_present = new_present;
+                    last_out_on  = me->out_on;
+                    last_v       = me->v_out;
+                    last_i       = me->i_out;
+                    last_t       = me->t_out;
 
-            if (new_present != last_present ||
-                me->out_on   != last_out_on  ||
-                fabsf(me->v_out - last_v) > 0.05f ||
-                fabsf(me->i_out - last_i) > 0.05f ||
-                fabsf(me->t_out - last_t) > 0.5f)
-            {
-                last_present = new_present;
-                last_out_on  = me->out_on;
-                last_v = me->v_out;
-                last_i = me->i_out;
-                last_t = me->t_out;
-
-                post_psu(me, new_present, me->out_on, me->v_out, me->i_out, me->t_out);
-            }
-            return Q_HANDLED();
+                    post_psu(me, new_present, me->out_on, me->v_out, me->i_out, me->t_out);
+                    publish_status(me);
     }
-        case PSU_REQ_SETPOINT_SIG: {
-            PsuSetEvt const *se = Q_EVT_CAST(PsuSetEvt);
-            me->vset = se->voltSet; me->iset = se->currSet; me->on = 1U;
+                    return Q_HANDLED();
+            }
+            case PSU_REQ_SETPOINT_SIG: {
+                    // refuse if not present (prevents programming into a bus error)
+                    if (me->present == 0U) {
+                        printf("COTEK: IGNORE setpoint (PSU not present)\r\n");
+                        return Q_HANDLED();
+                    }
+                    PsuSetEvt const *se = Q_EVT_CAST(PsuSetEvt);
+                    me->vset = se->voltSet;
+                    me->iset = se->currSet;
+                    me->on = 1U;
+                    /* Program the supply over I2C */
+                    cotek_set_remote_mode();
+                    cotek_set_output_voltage(me->vset);
+                    cotek_set_output_current(me->iset);
+                    cotek_commit_settings();
+                    cotek_power_on();
+                    me->out_on = 1U;
+
+
             printf("COTEK: ON V=%.2f I=%.2f\r\n", me->vset, me->iset);
-            /* In a real driver you’d program the PSU and maybe start a poll timer.
-               Here we just printf. */
-            return Q_HANDLED();
-        }
-        case PSU_REQ_OFF_SIG: {
-            me->on = 0U; printf("COTEK: OFF\r\n");
-            return Q_HANDLED();
-        }
+                    /* Push an immediate UI update so pMain shows PSU group “live” */
+                    post_psu(me,
+                             /*present=*/1U,
+                             /*output_on=*/me->out_on,
+                             /*v_out=*/me->vset,   /* show setpoints until readback arrives */
+                             /*i_out=*/0.0f,
+                             /*temp_C=*/NAN);
+
+                    printf("COTEK: ON V=%.2f I=%.2f\r\n", me->vset, me->iset);
+                    return Q_HANDLED();
+            }
+            case PSU_REQ_OFF_SIG: {
+                    me->on = 0U;
+                    cotek_set_remote_mode();
+                    cotek_power_off();   /* actively command OFF */
+                    printf("COTEK: OFF\r\n");
+                    me->startup_sync = 1U;
+                    me->off_acks = 0U;
+
+                    return Q_HANDLED();
+            }
     }
-    return Q_SUPER(&QHsm_top);
-}
+
+        return Q_SUPER(&QHsm_top);
+    }
+
 
 void cotek_set_remote_mode(void) {
     // Write 0x80 to 0x7C (bit 7 = 1 ? Remote mode)
@@ -217,4 +294,9 @@ float cotek_read_temperature() {
     HAL_I2C_Master_Transmit(&hi2c1, COTEK_I2C_ADDR, &reg, 1, I2C_TIMEOUT_MS);
     HAL_I2C_Master_Receive(&hi2c1, COTEK_I2C_ADDR, rx_data, 1, I2C_TIMEOUT_MS);
     return rx_data[0];
+}
+
+// simple health accessor for the controller
+uint8_t Cotek_isPresent(void) {
+    return l_psu.present;    // alive in the last ~1s
 }
