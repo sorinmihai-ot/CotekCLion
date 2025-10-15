@@ -21,3 +21,7 @@ Update the firmware string in **Core/Src/main.c**:
 // Firmware Version
 const char FW_VERSION_STR[] = "0.3.2";   // <- bump this
 
+Firmware V0.4.3:
+-The HMI need to be refresed if it looses the power temporarily
+-After the first charge, when the button is pressed again, the comms with the battery are lost, but it is not true
+-warning icon visibility
