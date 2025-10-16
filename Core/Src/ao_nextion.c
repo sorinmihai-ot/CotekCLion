@@ -63,6 +63,110 @@ static void ascii_sanitize(char *s) {
         if (c < 0x20 || c >= 0x7F) *s = '?';
     }
 }
+// --- PURE C, no lambdas, C11-compatible ---
+static void utf8_to_nextion_ascii(const char *in, char *out, size_t out_len) {
+    if (!in || !out || out_len == 0) return;
+
+    size_t w = 0;
+
+    // append one char safely; never emit 0xFF
+    #define EMIT(ch) do { \
+        if (w + 1 < out_len) { \
+            char _c = (char)(ch); \
+            out[w++] = (_c == (char)0xFF) ? '?' : _c; \
+        } \
+    } while (0)
+
+    // append two chars safely
+    #define EMIT2(a,b) do { \
+        if (w + 2 < out_len) { \
+            char _a = (char)(a); char _b = (char)(b); \
+            out[w++] = (_a == (char)0xFF) ? '?' : _a; \
+            out[w++] = (_b == (char)0xFF) ? '?' : _b; \
+        } \
+    } while (0)
+
+    const unsigned char *p = (const unsigned char*)in;
+    while (*p && w + 1 < out_len) {
+        unsigned char c = *p++;
+
+        // ASCII printable
+        if (c >= 0x20 && c < 0x7F) {
+            EMIT(c == '"' ? '\'' : (char)c);  // keep Nextion txt="..." safe
+            continue;
+        }
+
+        // control → space
+        if (c < 0x20) { EMIT(' '); continue; }
+
+        // UTF-8 2-byte Latin-1 blocks (C2/C3)
+        if (c == 0xC2 || c == 0xC3) {
+            unsigned char d = *p ? *p++ : 0;
+
+            if (c == 0xC2) {
+                switch (d) {
+                    case 0xA0: EMIT(' '); break;   // NBSP
+                    case 0xB0: EMIT(' '); break;   // degree (we already show " C")
+                    case 0xB5: EMIT('u'); break;   // µ → u
+                    default:   EMIT('?');  break;
+                }
+                continue;
+            }
+
+            // c == 0xC3 → U+00C0..U+00FF
+            switch (d) {
+                // A/a with diacritics
+                case 0x80: case 0x81: case 0x82: case 0x83: case 0x84: case 0x85: EMIT('A'); continue;
+                case 0xA0: case 0xA1: case 0xA2: case 0xA3: case 0xA4: case 0xA5: EMIT('a'); continue;
+
+                // AE/ae
+                case 0x86: EMIT2('A','E'); continue;
+                case 0xA6: EMIT2('a','e'); continue;
+
+                // C/c (cedilla)
+                case 0x87: EMIT('C'); continue;
+                case 0xA7: EMIT('c'); continue;
+
+                // E/e with diacritics
+                case 0x88: case 0x89: case 0x8A: case 0x8B: EMIT('E'); continue;
+                case 0xA8: case 0xA9: case 0xAA: case 0xAB: EMIT('e'); continue;
+
+                // I/i with diacritics
+                case 0x8C: case 0x8D: case 0x8E: case 0x8F: EMIT('I'); continue;
+                case 0xAC: case 0xAD: case 0xAE: case 0xAF: EMIT('i'); continue;
+
+                // N/ñ
+                case 0x91: EMIT('N'); continue;
+                case 0xB1: EMIT('n'); continue;
+
+                // O/o with diacritics (includes Ø/ø)
+                case 0x92: case 0x93: /*0x94*/ case 0x95: case 0x96: case 0x98: EMIT('O'); continue; // 0x94 falls here
+                case 0xB2: case 0xB3: /*0xB4*/ case 0xB5: /*0xB6*/ case 0xB8: EMIT('o'); continue;   // 0xB6 falls here
+
+                // U/u with diacritics
+                case 0x99: case 0x9A: case 0x9B: case 0x9C: EMIT('U'); continue;
+                case 0xB9: case 0xBA: case 0xBB: case 0xBC: EMIT('u'); continue;
+
+                // Y/ÿ
+                case 0x9D: EMIT('Y'); continue;
+                case 0xBF: EMIT('y'); continue;
+
+                // ß
+                case 0x9F: EMIT2('s','s'); continue;
+
+                default: EMIT('?'); continue;
+            }
+        }
+
+        // everything else (3/4-byte codepoints etc.)
+        EMIT('?');
+    }
+
+    out[w] = '\0';
+
+    #undef EMIT
+    #undef EMIT2
+}
 
 // Build text, sanitize, then send with terminator bytes.
 // Use this for any command that writes to .txt fields.

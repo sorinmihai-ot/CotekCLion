@@ -38,6 +38,9 @@ enum AppSignals {
     NEX_REQ_UPDATE_DETAILS_SIG,
     NEX_REQ_UPDATE_PSU_SIG,
 
+    //signal to move HMI to pWait after 10s
+    LOST_HOLD_TO_SIG,   // fired after 10s hold on pMain post comms-lost
+
     /* PSU control/status (direct posts) */
     PSU_REQ_SETPOINT_SIG,      /* Controller -> Cotek                        */
     PSU_REQ_OFF_SIG,           /* Controller -> Cotek                        */
