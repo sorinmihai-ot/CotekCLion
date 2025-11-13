@@ -49,7 +49,7 @@ extern "C" {
 
 //============================================================================
 #include "qp_port.h"      // QP port from the port directory
-#include "qsafe.h"        // QP Functional Safety (FuSa) Subsystem
+#include "qsafe.h"
 #ifdef Q_SPY // software tracing enabled?
     #include "qs_port.h"  // QS/C port from the port directory
 #else
