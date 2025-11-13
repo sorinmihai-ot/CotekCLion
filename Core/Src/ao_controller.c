@@ -12,20 +12,19 @@
 #include <math.h>
 #include "batt_classify.h"
 #include "bms_fault_decode.h"
+#include "bms_debug.h"
 
 static uint32_t s_last_sum_ms;
 static uint32_t s_last_det_ms;
 static uint32_t s_last_sum_hash, s_last_det_hash;
-static uint32_t last_bms_ms;
+/* Monotonic tick accessor (HAL_GetTick or BSP tick) */
+uint32_t tick_ms(void);
+/* Local mirrors to detect transitions and de-spam logs */
+static uint8_t  s_prev_fresh = 255U;    /* 255 = unknown first run */
+static uint32_t s_prev_age_bucket = 999999U;
 // Use the mapper from bms_app.c
 extern const char *BMS_state_to_text(uint16_t batt_type, uint8_t raw_state);
-static inline bool bms_sim_is_active(void) {
-#ifdef ENABLE_BMS_SIM
-    return true;      // SIM build: treat as active, never classify/gate
-#else
-    return false;     // Non-SIM build: classification will run
-#endif
-}
+
 
 Q_DEFINE_THIS_FILE
 typedef enum
@@ -38,7 +37,6 @@ typedef enum
 
 typedef struct {
     QActive  super;
-    QTimeEvt tBmsWatch;   // new: BMS RX watchdog
     QTimeEvt ui2s;      /* periodic UI refresh (2s) */
     QTimeEvt tCharge;   /* charging timeout (60s) */
     QTimeEvt tPsuOff;    // short watchdog while waiting for OFF confirm
@@ -353,10 +351,9 @@ static void make_details(NextionDetailsEvt *de, const BmsTelemetry *t) {
         char reasons[128];
         BmsSeverity sev;
         decode_faults_for_ui(t, reasons, sizeof(reasons), &sev);
-        strncpy(de->bms_fault_str, reasons, sizeof(de->bms_fault_str)-1);
-        de->bms_fault_str[sizeof(de->bms_fault_str)-1] = '\0';
-        snprintf(de->bms_fault_str, sizeof(de->bms_fault_str), "0x%02X", t->bms_fault);
-    }
+        snprintf(de->bms_fault_str, sizeof(de->bms_fault_str),
+                 "%s (0x%02X)", reasons, t->bms_fault);
+        }
     printf("CTL: posting details to HMI\n");
 }
 
@@ -439,34 +436,6 @@ static void post_psu_to_hmi(uint8_t present, uint8_t output_on,
 
 static bool in_charge;
 
-// static void post_page_ex(ControllerAO *me, uint8_t page) {
-//
-//     me->page = page;
-//
-//     // tell Nextion to change page
-//     NextionPageEvt *pg = Q_NEW(NextionPageEvt, NEX_REQ_SHOW_PAGE_SIG);
-//     pg->page = page;
-//     if (!QACTIVE_POST_X(AO_Nextion, &pg->super, QF_NO_MARGIN, 0U)) {
-//         QF_gc(&pg->super);
-//     }
-//
-//     // force next UI publish to repaint (reset de-dupe hashes)
-//     s_last_sum_hash = 0U;
-//     s_last_det_hash = 0U;
-//
-//     // repaint immediately if we already have data
-//     if (me->haveData) {
-//         if (page == 2U) {               // pMain
-//             post_summary_force(me, (me->state == CTL_STATE_CHARGE || me->state==CTL_STATE_DETECT), NULL);
-//             post_psu_to_hmi(me->psu_present, me->psu_out_on,
-//                         me->psu_v_out, me->psu_i_out, me->psu_temp);
-//             //post_summary(me, (me->state == CTL_STATE_CHARGE || me->state==CTL_STATE_DETECT), NULL);
-//         } else if (page == 3U) {        // pDetails
-//             post_details(me);
-//             post_details_force(me);
-//         }
-//     }
-// }
 static void post_page_ex(ControllerAO *me, uint8_t page) {
     // keep our own notion of the current page in sync
     me->page = page;
@@ -497,45 +466,62 @@ static void post_page_ex(ControllerAO *me, uint8_t page) {
     }
 }
 
-static void post_comms_lost(ControllerAO *me) {
-    // Build a normal summary, then override just what we need.
+static void post_comms_lost(const ControllerAO *me) {
+    // ensure next summary pushes through no matter what
+    s_last_sum_hash = 0U;
+    s_last_det_hash = 0U;
+
     NextionSummaryEvt *se = Q_NEW(NextionSummaryEvt, NEX_REQ_UPDATE_SUMMARY_SIG);
     make_summary(se, &me->last);
 
-    strncpy(se->classStr, "Comms Lost with the Battery!", sizeof(se->classStr)-1);
+    strncpy(se->classStr, "Comms Lost!", sizeof(se->classStr)-1);
     se->classStr[sizeof(se->classStr)-1] = '\0';
 
-    strncpy(se->reason, "Check the connection with the Battery!", sizeof(se->reason)-1);
+    strncpy(se->reason, "Check the battery connection", sizeof(se->reason)-1);
     se->reason[sizeof(se->reason)-1] = '\0';
 
-    se->warnIcon = 1U;        // turn the warning icon ON
-    se->charging = 0U;        // not charging
+    se->warnIcon = 1U;
+    se->charging = 0U;
+    se->recoverable = 0U; // show as not recoverable while we’re blind
 
     if (!QACTIVE_POST_X(AO_Nextion, &se->super, QF_NO_MARGIN, &me->super)) {
         QF_gc(&se->super);
     }
 }
 
-// static inline void bms_watch_kick(ControllerAO *me, QTimeEvtCtr ticks) {
-//     /* If it was already armed, rearm updates its timeout safely.
-//        If it wasn't armed, re-arm returns false → do a fresh armX. */
-//     if (!QTimeEvt_rearm(&me->tBmsWatch, ticks)) {
-//         QTimeEvt_armX(&me->tBmsWatch, ticks, 0U);
-//     }
-// }
-//
-// static inline void psuoff_start(ControllerAO *me, QTimeEvtCtr ticks){
-//     if (!QTimeEvt_rearm(&me->tPsuOff, ticks)) {
-//         QTimeEvt_armX(&me->tPsuOff, ticks, 0U);
-//     }
-// }
+static inline uint32_t bms_age_ms(void) {
+    return tick_ms() - last_bms_ms;
+}
+/* coarsen an age to 100 ms buckets so we don’t spam */
+static inline uint32_t age_bucket_100ms(uint32_t age_ms){
+    return age_ms / 100U;
+}
+/* Example freshness checker used by UI + controller */
+bool bms_is_fresh(void){
+    uint32_t age = bms_age_ms();
+    bool fresh = (age < BMS_WATCH_MS);  /* or whatever threshold you use for 'fresh' */
+
+#if BMS_DEBUG
+    if (s_prev_fresh == 255U) {
+        BMS_DBG("BMSDBG: init freshness fresh=%u age=%lu ms (th=%lu)\r\n",
+                (unsigned)fresh, (unsigned long)age, (unsigned long)BMS_WATCH_MS);
+    } else if ((bool)s_prev_fresh != fresh) {
+        BMS_DBG("BMSDBG: freshness transition %s → %s at age=%lu ms\r\n",
+                s_prev_fresh ? "FRESH" : "STALE",
+                fresh ? "FRESH" : "STALE",
+                (unsigned long)age);
+    }
+    s_prev_fresh = (uint8_t)fresh;
+#endif
+    return fresh;
+}
+
 /* ctor */
 void ControllerAO_ctor(void) {
 #ifdef ENABLE_BMS_SIM
     QTimeEvt_ctorX(&l_ctl.simTick, &l_ctl.super, SIM_TICK_SIG, 0U);
 #endif
     QActive_ctor(&l_ctl.super, Q_STATE_CAST(&Ctl_initial));
-    QTimeEvt_ctorX(&l_ctl.tBmsWatch, &l_ctl.super, BMS_WATCHDOG_TO_SIG, 0U);
     QTimeEvt_ctorX(&l_ctl.ui2s,   &l_ctl.super, TIMEOUT_SIG, 0U);
     QTimeEvt_ctorX(&l_ctl.tCharge, &l_ctl.super, CHARGE_TIMEOUT_SIG, 0U);
     QTimeEvt_ctorX(&l_ctl.tPsuOff, &l_ctl.super, PSU_OFF_WAIT_TO_SIG, 0U);
@@ -616,7 +602,6 @@ static QState Ctl_run(ControllerAO * const me, QEvt const * const e) {
         return Q_HANDLED();
     }
     case BMS_UPDATED_SIG: {
-        QTimeEvt_disarm(&me->tLostHold);
         BmsTelemetryEvt const *be = Q_EVT_CAST(BmsTelemetryEvt);
         me->haveData = 1U;
         me->last     = be->data;
@@ -633,27 +618,19 @@ static QState Ctl_run(ControllerAO * const me, QEvt const * const e) {
             post_summary(me, /*charging?*/ false, "BMS updated");
             post_details(me);
         }
-        // we saw fresh BMS data -> (re)start watchdog for ~1.5s
-        last_bms_ms = HAL_GetTick();
-        //bms_watch_kick(me, 150U);
+
         return Q_HANDLED();
     }
-    // case BMS_WATCHDOG_TO_SIG: {
-    //     printf("CTL: BMS watchdog fired1 → comms lost\n");
-    //     // No frames for the window → treat as comms lost
-    //     me->haveData = 0U;
-    //
-    //     if (me->page == 3U) {
-    //         post_page_ex(me, 2U);   // force pMain
-    //     }
-    //     if (me->page == 2U) {
-    //         post_comms_lost(me);    // banner + pWarn ON
-    //     }
-    //     printf("CTL: BMS watchdog fired2 → comms lost\n");
-    //     // Optionally turn PSU OFF or leave that to charge-state only.
-    //     return Q_HANDLED();
-    //     }
     case TIMEOUT_SIG: {
+        uint32_t age = bms_age_ms();
+        uint32_t bucket = age_bucket_100ms(age);
+        if (bucket != s_prev_age_bucket) {
+            s_prev_age_bucket = bucket;
+            BMS_DBG("BMSDBG: HB age=%lu ms fresh=%u haveData=%u state=%u page=%u\r\n",
+                    (unsigned long)age, (unsigned)bms_is_fresh(),
+                    (unsigned)me->haveData, (unsigned)me->state,
+                    (unsigned)me->page);
+        }
         if (!me->haveData) { return Q_HANDLED(); }  // nothing fresh → don’t overwrite banner
 
         if (me->page == 3U) {
@@ -663,13 +640,15 @@ static QState Ctl_run(ControllerAO * const me, QEvt const * const e) {
         }
         return Q_HANDLED();
     }
-    case BUTTON_PRESSED_SIG: {
-        /* Only act if we have a battery detected */
-        if (me->haveData) {
-            return Q_TRAN(&Ctl_charge);   /* logic lives in the charge state's entry */
-        }
-        return Q_HANDLED();
-        }
+    // case BUTTON_PRESSED_SIG: {
+    //     /* Only act if we have a battery detected */
+    //     if (me->haveData && bms_is_fresh()) {
+    //         return Q_TRAN(&Ctl_charge);   /* logic lives in the charge state's entry */
+    //     }
+    //     /* stale or missing: refuse cleanly */
+    //     post_summary(me, false, me->haveData ? "No recent BMS data" : "No battery detected");
+    //     return Q_HANDLED();
+    //     }
     case NEX_REQ_SHOW_PAGE_SIG: {  // coming FROM Nextion via Nextion_OnRx()
         NextionPageEvt const *pe = (NextionPageEvt const*)e;
         me->page = pe->page;
@@ -688,6 +667,8 @@ static QState Ctl_run(ControllerAO * const me, QEvt const * const e) {
         }
     case BMS_CONN_LOST_SIG: {
         me->haveData = 0U;
+        /* NEW: wipe last-known telemetry so UI can’t reuse stale numbers */
+        memset(&me->last, 0, sizeof(me->last));
 
         // If user is on pDetails, switch to pMain
         if (me->page == 3U) {
@@ -706,9 +687,9 @@ static QState Ctl_run(ControllerAO * const me, QEvt const * const e) {
         if (!QACTIVE_POST_X(AO_Cotek, off, QF_NO_MARGIN, 0U)) {
             QF_gc(off);
         }
-        /* 2) start short timeout (e.g., 500 ms) as a guard */
-        QTimeEvt_armX(&me->tPsuOff, 50U, 0U);   /* assuming your tick is 10ms */
-        /* 3) go wait for confirmation */
+        // /* 2) start short timeout (e.g., 500 ms) as a guard */
+        // QTimeEvt_armX(&me->tPsuOff, 50U, 0U);   /* assuming your tick is 10ms */
+        /* 3) go wait for OFF confirmation, timer will be armed in the entry case */
         return Q_TRAN(&Ctl_poweringDown);
         }
     case LOST_HOLD_TO_SIG: {
@@ -755,11 +736,12 @@ static QState Ctl_wait(ControllerAO * const me, QEvt const * const e) {
                 post_details(me);
 
             }
-            return Q_HANDLED();
+
+        //leave WAIT once we have data, so button logic / PSU checks live in Ctl_detect
+        return Q_TRAN(&Ctl_detect);
     }
     case BMS_NO_BATTERY_SIG: {
-        // QTimeEvt_disarm(&me->tBmsWatch);
-        // return Q_HANDLED();
+        return Q_HANDLED();
     }
     case BMS_CONN_LOST_SIG: {
         // QTimeEvt_disarm(&me->tBmsWatch);
@@ -791,7 +773,15 @@ static QState Ctl_detect(ControllerAO * const me, QEvt const * const e) {
         if (me->page == 3U) {
             post_details(me);
         } else if (me->page == 2U) {
-            post_summary(me, false, 0);
+            if (!bms_is_fresh()) {
+                char why[64];
+                // show age with one decimal (e.g. "No fresh BMS for 1.7 s")
+                float age_s = bms_age_ms() / 1000.0f;
+                snprintf(why, sizeof(why), "No fresh BMS for %.1f s", (double)age_s);
+                post_summary(me, false, why);
+            } else {
+                post_summary(me, false, 0);
+            }
         }
         printf("pMain: V=%.2fV type=0x%04X state=%u soc=%u recoverable=%u reason=\"%s\"\r\n",
                    (double)me->last.array_voltage_V,
@@ -803,19 +793,17 @@ static QState Ctl_detect(ControllerAO * const me, QEvt const * const e) {
         return Q_HANDLED();
     }
     case BMS_UPDATED_SIG: {
-        QTimeEvt_disarm(&me->tLostHold);
         BmsTelemetryEvt const *be = Q_EVT_CAST(BmsTelemetryEvt);
         me->last = be->data; me->haveData = 1U;
         post_summary(me, false, "ready to charge");
         post_details(me);
-        // we saw fresh BMS data -> (re)start watchdog for ~1.5s
-        last_bms_ms = HAL_GetTick();
-        // bms_watch_kick(me, 150U);
-        // printf("CTL: BMS watchdog arm 1500ms\n");
         return Q_HANDLED();
     }
     case BMS_CONN_LOST_SIG: {
         me->haveData = 0U;
+        /* NEW: wipe last-known telemetry so UI can’t reuse stale numbers */
+        memset(&me->last, 0, sizeof(me->last));
+
         // If user is on pDetails, switch to pMain
         if (me->page == 3U) {
             post_page_ex(me, 2U);   // pMain
@@ -836,7 +824,10 @@ static QState Ctl_detect(ControllerAO * const me, QEvt const * const e) {
         post_summary(me, false, "PSU not present/error");
         return Q_HANDLED();
     }
-
+    if (!me->haveData || !bms_is_fresh()) {
+        post_summary(me, false, "No recent BMS data");
+        return Q_HANDLED();
+    }
 #if !defined(ENABLE_BMS_SIM)
     BattClassResult cr = batt_classify(&me->last, /*bms_sim_active=*/false);
 
@@ -917,7 +908,6 @@ static QState Ctl_charge(ControllerAO * const me, QEvt const * const e) {
         return Q_HANDLED();
     }
     case BMS_UPDATED_SIG: {
-        QTimeEvt_disarm(&me->tLostHold);
         BmsTelemetryEvt const *be = Q_EVT_CAST(BmsTelemetryEvt);
         me->last = be->data; me->haveData = 1U;
 
@@ -936,18 +926,11 @@ static QState Ctl_charge(ControllerAO * const me, QEvt const * const e) {
         }
         /* refresh UI while charging */
         post_summary(me, true, "charging");
-        // printf("pMain: CHG V=%.2fV type=0x%04X T=%.1fC soc=%u reason=\"charging\"\r\n",
-        //        (double)me->last.array_voltage_V,
-        //        (unsigned)me->last.battery_type_code,
-        //        (double)me->last.sys_temp_high_C,
-        //        (unsigned)me->last.soc_percent);
-        // we saw fresh BMS data -> (re)start watchdog for ~1.5s
-        last_bms_ms = HAL_GetTick();
-        // bms_watch_kick(me, 150U);
-        // printf("CTL: BMS watchdog arm 1500ms\n");
         return Q_HANDLED();
     }
     case BMS_CONN_LOST_SIG: {
+        /* NEW: wipe last-known telemetry so UI can’t reuse stale numbers */
+        memset(&me->last, 0, sizeof(me->last));
 
         post_summary(me, false, "Stopped: BMS lost");
         // ensure page and comms-lost banner + warn icon
@@ -960,9 +943,9 @@ static QState Ctl_charge(ControllerAO * const me, QEvt const * const e) {
         if (!QACTIVE_POST_X(AO_Cotek, off, QF_NO_MARGIN, 0U)) {
             QF_gc(off);
         }
-        /* 2) start short timeout (e.g., 500 ms) as a guard */
-        QTimeEvt_armX(&me->tPsuOff, 50U, 0U);   /* assuming your tick is 10ms */
-        /* 3) go wait for confirmation */
+        // /* 2) start short timeout (e.g., 500 ms) as a guard */
+        // QTimeEvt_armX(&me->tPsuOff, 50U, 0U);   /* assuming your tick is 10ms */
+        /* 3) go wait for OFF confirmation */
         return Q_TRAN(&Ctl_poweringDown);
     }
     case CHARGE_TIMEOUT_SIG: {
@@ -997,19 +980,20 @@ static QState Ctl_poweringDown(ControllerAO * const me, QEvt const * const e) {
     switch (e->sig) {
     case Q_ENTRY_SIG: {
             // Ask PSU to turn OFF
-            QEvt *off = Q_NEW(QEvt, PSU_REQ_OFF_SIG);
+        QEvt *off = Q_NEW(QEvt, PSU_REQ_OFF_SIG);
             // UI/PSU requests are “best effort”: use margin 0U and GC if it can’t be queued right now
-            if (!QACTIVE_POST_X(AO_Cotek, off, 1U, 0U)) {
+        if (!QACTIVE_POST_X(AO_Cotek, off, 1U, 0U)) {
                 QF_gc(off);
             }
 
             // Start a short watchdog while waiting for confirmation.
             // 200ms is typical; tune as you like.
-            QTimeEvt_armX(&me->tPsuOff, BSP_TICKS_PER_SEC / 5U, 0U);
+        QTimeEvt_disarm(&me->tPsuOff);
+        QTimeEvt_armX(&me->tPsuOff, BSP_TICKS_PER_SEC / 5U, 0U);
             // psuoff_start(me,20U);
             // Optional: tell UI we’re stopping (don’t say OFF yet)
-            post_summary(me, false, "stopping...");
-            return Q_HANDLED();
+        post_summary(me, false, "stopping...");
+        return Q_HANDLED();
     }
     case PSU_RSP_STATUS_SIG: {
             // Check the status “output disabled?”

@@ -1,12 +1,9 @@
-
 /**
  * bms_fault_decode.c
  */
 #include "bms_fault_decode.h"
 #include <string.h>
 #include <stdio.h>
-
-/*--------------------------- local utils ---------------------------*/
 
 static inline bool bit(uint32_t v, unsigned i){ return (v >> i) & 1U; }
 
@@ -16,7 +13,6 @@ static void append_reason(char *dst, size_t cap, const char *txt) {
     if (len && len < cap-2) { dst[len++] = ','; dst[len++] = ' '; dst[len] = '\0'; }
     strncat(dst, txt, cap - strlen(dst) - 1);
 }
-
 static void set_if_empty(char *dst, size_t cap, const char *txt) {
     if (dst && dst[0] == '\0') {
         strncpy(dst, txt, cap);
@@ -35,7 +31,6 @@ const char* bms_severity_to_text(BmsSeverity sev){
         default:                return "Unknown";
     }
 }
-
 const char* bms_family_to_text(BmsBatteryFamily fam){
     switch(fam){
         case BMS_FAM_HYP400:      return "HYP400";
@@ -48,23 +43,13 @@ const char* bms_family_to_text(BmsBatteryFamily fam){
     }
 }
 
-/*---------------- BMZ500 / CP600 (pack fault bitfield) ---------------*/
-
+/* BMZ500 / CP600: 8-bit pack fault */
 void bms_decode_bmz500_cp600(uint8_t f, char *out, size_t cap,
                              BmsSeverity *out_sev, BmsDomainMask *out_domains){
     if(out) out[0]='\0';
     if(out_sev) *out_sev = BMS_SEV_NONE;
     if(out_domains) *out_domains = BMS_DOM_NONE;
-    /* Bit meanings per spec (BMZ500 and CP600 align):
-       0: Charger current > demand
-       1: Discharge overcurrent
-       2: Under-voltage
-       3: Over-voltage
-       4: Over-temperature
-       5: Under-temperature
-       6: General BMS fault
-       7: Voltage imbalance
-    */
+
     if(bit(f,0)) { append_reason(out,cap,"Charger current > demand"); if(out_domains) *out_domains |= BMS_DOM_CURR; }
     if(bit(f,1)) { append_reason(out,cap,"Discharge overcurrent");    if(out_domains) *out_domains |= BMS_DOM_CURR; }
     if(bit(f,2)) { append_reason(out,cap,"Under-voltage");            if(out_domains) *out_domains |= BMS_DOM_VOLT; }
@@ -74,9 +59,6 @@ void bms_decode_bmz500_cp600(uint8_t f, char *out, size_t cap,
     if(bit(f,6)) { append_reason(out,cap,"General BMS fault");        if(out_domains) *out_domains |= BMS_DOM_OTHER; }
     if(bit(f,7)) { append_reason(out,cap,"Voltage imbalance");        if(out_domains) *out_domains |= BMS_DOM_BAL; }
 
-    /* Severity heuristics: voltage/current/temperature => FAULT, imbalance => WARNING,
-       general bms fault -> HW_FAULT (could be downgraded to FAULT if desired).
-    */
     if(out_sev){
         if (f == 0) *out_sev = BMS_SEV_NONE;
         else if (bit(f,6)) *out_sev = BMS_SEV_HW_FAULT;
@@ -87,16 +69,13 @@ void bms_decode_bmz500_cp600(uint8_t f, char *out, size_t cap,
     set_if_empty(out,cap,"None");
 }
 
-/*----------------------------- HYP500 --------------------------------*/
-
+/* HYP500 */
 static BmsSeverity map_hyp500_sev(uint8_t raw){
-    /* Map your firmware's constants; examples seen: 0xC1,0xC2,0xC3 */
     switch(raw){
         case 0xC1: return BMS_SEV_WARNING;
         case 0xC2: return BMS_SEV_FAULT;
         case 0xC3: return BMS_SEV_FATAL;
         default:
-            /* fall back: 0x00 none, 0x01 warn, 0x02 fault, 0x03 permanent, 0x04 hw fault */
             switch(raw){
                 case 0x00: return BMS_SEV_NONE;
                 case 0x01: return BMS_SEV_WARNING;
@@ -107,7 +86,6 @@ static BmsSeverity map_hyp500_sev(uint8_t raw){
             }
     }
 }
-
 void bms_decode_hyp500(uint8_t hw_fault, uint8_t error_sev_raw, uint8_t error_code,
                        char *out, size_t cap,
                        BmsSeverity *out_sev,
@@ -120,11 +98,9 @@ void bms_decode_hyp500(uint8_t hw_fault, uint8_t error_sev_raw, uint8_t error_co
     if(bit(hw_fault,2)) { append_reason(out,cap,"CAN bus error"); if(out_domains) *out_domains |= BMS_DOM_HWCOMM; }
     if(bit(hw_fault,3)) { append_reason(out,cap,"SPI error");     if(out_domains) *out_domains |= BMS_DOM_HWCOMM; }
 
-    /* Error severity + code */
     BmsSeverity sev = map_hyp500_sev(error_sev_raw);
     if(out_sev) *out_sev = sev;
 
-    /* We don't have the textual table for error_code yet; show numeric */
     char tmp[64];
     snprintf(tmp, sizeof(tmp), "Severity: %s (0x%02X), Code: 0x%02X",
              bms_severity_to_text(sev), error_sev_raw, error_code);
@@ -133,8 +109,7 @@ void bms_decode_hyp500(uint8_t hw_fault, uint8_t error_sev_raw, uint8_t error_co
     set_if_empty(out,cap,"None");
 }
 
-/*----------------------------- HYP400 --------------------------------*/
-
+/* HYP400 */
 void bms_decode_hyp400(const BmsHyp400Input *in,
                        char *out, size_t cap,
                        BmsSeverity *out_sev,
@@ -161,8 +136,7 @@ void bms_decode_hyp400(const BmsHyp400Input *in,
     set_if_empty(out,cap,"None");
 }
 
-/*----------------------------- CP400 --------------------------------*/
-
+/* CP400 */
 static BmsSeverity map_cp400_master(uint8_t code){
     switch(code){
         case 0x00: return BMS_SEV_NONE;
@@ -173,7 +147,6 @@ static BmsSeverity map_cp400_master(uint8_t code){
         default:   return BMS_SEV_FAULT;
     }
 }
-
 void bms_decode_cp400(const BmsCp400Input *in,
                       char *out, size_t cap,
                       BmsSeverity *out_sev,
@@ -182,7 +155,6 @@ void bms_decode_cp400(const BmsCp400Input *in,
     if(out) out[0]='\0';
     if(out_domains) *out_domains = BMS_DOM_NONE;
 
-    /* Overall state first */
     BmsSeverity master = map_cp400_master(in->master_fault_code);
     char tmp[48];
     snprintf(tmp,sizeof(tmp),"State: %s (0x%02X)", bms_severity_to_text(master), in->master_fault_code);
@@ -201,8 +173,7 @@ void bms_decode_cp400(const BmsCp400Input *in,
     set_if_empty(out,cap,"None");
 }
 
-/*--------------------------- Single entry ---------------------------*/
-
+/* Single entry */
 void bms_decode_any(const BmsDecodeInput *in,
                     char *out, size_t out_cap,
                     BmsSeverity *out_sev,

@@ -24,6 +24,10 @@ extern "C" {
     /* Bring up CAN, configure an "accept-all" filter into FIFO0,
      * start the peripheral and enable FIFO0-msg-pending interrupt. */
     void CANAPP_InitAll(void);
+    /* NEW: gate RX notifications on/off (safe to call multiple times) */
+    void CANAPP_EnableRx(bool enable);
+    /* NEW: drain all pending frames from FIFO0 (used before enabling) */
+    void CANAPP_FlushRx(void);
 
 #ifdef __cplusplus
 }

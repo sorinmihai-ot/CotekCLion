@@ -276,6 +276,8 @@ int main(void)
   //nex_send3("pSplash.tVer.txt=\"FW v0.3.1\"");
   nex_send3("ref pSplash.tVer");
   HAL_Delay(3000);
+  /* Open the CAN gate once AOs/UI are fully up and HMI has settled */
+  CANAPP_EnableRx(true);
   printf("sizeof(NextionSummaryEvt)=%u  Details=%u\r\n",
        (unsigned)sizeof(NextionSummaryEvt),
        (unsigned)sizeof(NextionDetailsEvt));

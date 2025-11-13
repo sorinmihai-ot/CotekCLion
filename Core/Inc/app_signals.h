@@ -25,6 +25,8 @@ enum AppSignals {
     PSU_OFF_WAIT_TO_SIG,     // internal: watchdog while we wait for OFF confirmation
     BMS_TICK_SIG,              /* internal periodic tick for BMS*/
     BMS_WATCHDOG_TO_SIG,   // controller-side: no BMS updates in the timeout window
+    //signal to move HMI to pWait after 10s
+    LOST_HOLD_TO_SIG,   // fired after 10s hold on pMain post comms-lost
 #ifdef ENABLE_BMS_SIM
     SIM_TICK_SIG,          /* private periodic tick for the in-firmware BMS simulator */
 #endif
@@ -37,11 +39,7 @@ enum AppSignals {
     NEX_REQ_UPDATE_LIVE_SIG,
     NEX_REQ_UPDATE_DETAILS_SIG,
     NEX_REQ_UPDATE_PSU_SIG,
-
-    //signal to move HMI to pWait after 10s
-    LOST_HOLD_TO_SIG,   // fired after 10s hold on pMain post comms-lost
-
-    /* PSU control/status (direct posts) */
+        /* PSU control/status (direct posts) */
     PSU_REQ_SETPOINT_SIG,      /* Controller -> Cotek                        */
     PSU_REQ_OFF_SIG,           /* Controller -> Cotek                        */
     PSU_RSP_STATUS_SIG,        /* Cotek -> Controller  */
