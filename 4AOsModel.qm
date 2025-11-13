@@ -1,0 +1,1849 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<model version="7.0.2" links="0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.state-machine.com/qm/qm7.xsd">
+ <framework name="qpc"/>
+ <package name="AOs" stereotype="0x02">
+  <package name="controller" stereotype="0x00">
+   <class name="Controller" superclass="qpc::QActive">
+    <documentation>prio 4</documentation>
+    <attribute name="ui2s" type="QTimeEvt" visibility="0x02" properties="0x00">
+     <code>QTimeEvt ui2s;</code>
+    </attribute>
+    <attribute name="tBmsWatch" type="QTimeEvt" visibility="0x02" properties="0x00"/>
+    <attribute name="tCharge" type="QTimeEvt" visibility="0x02" properties="0x00"/>
+    <attribute name="tPsuOff" type="QTimeEvt" visibility="0x02" properties="0x00"/>
+    <attribute name="simTick" type="QTimeEvt" visibility="0x02" properties="0x00"/>
+    <attribute name="page" type="uint8_t" visibility="0x02" properties="0x00"/>
+    <attribute name="last" type="BmsTelemetry" visibility="0x02" properties="0x00"/>
+    <attribute name="haveData" type="uint8_t" visibility="0x02" properties="0x00"/>
+    <attribute name="psu_present" type="uint8_t" visibility="0x02" properties="0x00"/>
+    <attribute name="psu_out_on" type="uint8_t" visibility="0x02" properties="0x00"/>
+    <attribute name="psu_v_out" type="float" visibility="0x02" properties="0x00"/>
+    <attribute name="psu_i_out" type="float" visibility="0x02" properties="0x00"/>
+    <attribute name="psu_temp" type="float" visibility="0x02" properties="0x00"/>
+    <attribute name="state" type="ctl_state_t" visibility="0x02" properties="0x00"/>
+    <attribute name="super" type="QActive" visibility="0x02" properties="0x00"/>
+    <operation name="post_page_ex(ControllerAO *me, uint8_t page)" type="void" visibility="0x02" properties="0x01">
+     <code>    // keep our own notion of the current page in sync
+    me-&gt;page = page;
+
+    // tell Nextion to change page
+    NextionPageEvt *pg = Q_NEW(NextionPageEvt, NEX_REQ_SHOW_PAGE_SIG);
+    pg-&gt;page = page;
+    if (!QACTIVE_POST_X(AO_Nextion, &amp;pg-&gt;super, QF_NO_MARGIN, 0U)) {
+        QF_gc(&amp;pg-&gt;super);
+    }
+
+    // force next UI publish to repaint (reset de-dupe hashes)
+    s_last_sum_hash = 0U;
+    s_last_det_hash = 0U;
+
+    // repaint immediately if we already have data
+    if (me-&gt;haveData) {
+        if (page == 2U) {    // pMain
+            post_summary_force(me,
+                (me-&gt;state == CTL_STATE_CHARGE || me-&gt;state == CTL_STATE_DETECT),
+                NULL);
+            // also push last-known PSU snapshot right away
+            post_psu_to_hmi(me-&gt;psu_present, me-&gt;psu_out_on,
+                            me-&gt;psu_v_out, me-&gt;psu_i_out, me-&gt;psu_temp);
+        } else if (page == 3U) {   // pDetails
+            post_details_force(me);
+        }
+    }
+</code>
+    </operation>
+    <operation name="post_comms_lost(ControllerAO *me)" type="void" visibility="0x02" properties="0x01">
+     <code>// Build a normal summary, then override just what we need.
+    NextionSummaryEvt *se = Q_NEW(NextionSummaryEvt, NEX_REQ_UPDATE_SUMMARY_SIG);
+    make_summary(se, &amp;me-&gt;last);
+
+    strncpy(se-&gt;classStr, &quot;Comms Lost with the Battery!&quot;, sizeof(se-&gt;classStr)-1);
+    se-&gt;classStr[sizeof(se-&gt;classStr)-1] = '\0';
+
+    strncpy(se-&gt;reason, &quot;Check the connection with the Battery!&quot;, sizeof(se-&gt;reason)-1);
+    se-&gt;reason[sizeof(se-&gt;reason)-1] = '\0';
+
+    se-&gt;warnIcon = 1U;        // turn the warning icon ON
+    se-&gt;charging = 0U;        // not charging
+
+    if (!QACTIVE_POST_X(AO_Nextion, &amp;se-&gt;super, QF_NO_MARGIN, &amp;me-&gt;super)) {
+        QF_gc(&amp;se-&gt;super);
+    }</code>
+    </operation>
+    <operation name="post_psu_to_hmi(uint8_t present, uint8_t output_on,  float v_out, float i_out, float temp_C)" type="void" visibility="0x02" properties="0x01">
+     <code>NextionPsuEvt *pe = Q_NEW(NextionPsuEvt, NEX_REQ_UPDATE_PSU_SIG);
+    pe-&gt;present   = present;
+    pe-&gt;output_on = output_on;   // matches NextionPsuEvt field name
+    pe-&gt;v_out     = v_out;
+    pe-&gt;i_out     = i_out;
+    pe-&gt;temp_C    = temp_C;
+
+    if (!QACTIVE_POST_X(AO_Nextion, &amp;pe-&gt;super, QF_NO_MARGIN, 0U)) {
+        QF_gc(&amp;pe-&gt;super);
+    }</code>
+    </operation>
+    <operation name="post_details_force(ControllerAO *me)" type="void" visibility="0x02" properties="0x01">
+     <code>NextionDetailsEvt *de = Q_NEW(NextionDetailsEvt, NEX_REQ_UPDATE_DETAILS_SIG);
+    make_details(de, &amp;me-&gt;last);
+    if (!QACTIVE_POST_X(AO_Nextion, &amp;de-&gt;super, QF_NO_MARGIN, &amp;me-&gt;super)) {
+        QF_gc(&amp;de-&gt;super);
+    }</code>
+    </operation>
+    <operation name="post_summary_force(ControllerAO *me, bool charging, char const *reason)" type="void" visibility="0x02" properties="0x01">
+     <code>// build (no ui_ok_now_sum, no hash compare)
+    NextionSummaryEvt *se = Q_NEW(NextionSummaryEvt, NEX_REQ_UPDATE_SUMMARY_SIG);
+    make_summary(se, &amp;me-&gt;last);
+    se-&gt;charging = charging ? 1U : 0U;
+    if (reason &amp;&amp; reason[0]) {
+        strncpy(se-&gt;reason, reason, sizeof(se-&gt;reason)-1);
+        se-&gt;reason[sizeof(se-&gt;reason)-1] = '\0';
+    } else {
+        se-&gt;reason[0] = '\0';
+    }
+    if (!QACTIVE_POST_X(AO_Nextion, &amp;se-&gt;super, QF_NO_MARGIN, &amp;me-&gt;super)) {
+        QF_gc(&amp;se-&gt;super);
+    }</code>
+    </operation>
+    <operation name="post_details(ControllerAO *me)" type="void" visibility="0x00" properties="0x01">
+     <code>if (!ui_ok_now_det()) return;
+
+    uint32_t h = hash_details(&amp;me-&gt;last);
+    if (h == s_last_det_hash) return;
+    s_last_det_hash = h;
+
+    NextionDetailsEvt *de = Q_NEW(NextionDetailsEvt, NEX_REQ_UPDATE_DETAILS_SIG);
+    make_details(de, &amp;me-&gt;last);
+    if (!QACTIVE_POST_X(AO_Nextion, &amp;de-&gt;super, QF_NO_MARGIN, &amp;me-&gt;super)) {
+        QF_gc(&amp;de-&gt;super);
+    }</code>
+    </operation>
+    <operation name="post_summary(ControllerAO *me, bool charging, char const *reason)" type="void" visibility="0x02" properties="0x01">
+     <code>if (!ui_ok_now_sum()) return;
+
+    uint32_t h = hash_summary(&amp;me-&gt;last, charging, reason);
+    if (h == s_last_sum_hash) return;
+    s_last_sum_hash = h;
+
+    NextionSummaryEvt *se = Q_NEW(NextionSummaryEvt, NEX_REQ_UPDATE_SUMMARY_SIG);
+    make_summary(se, &amp;me-&gt;last);
+    se-&gt;charging = charging ? 1U : 0U;
+    if (reason &amp;&amp; reason[0]) {
+        strncpy(se-&gt;reason, reason, sizeof(se-&gt;reason)-1);
+        se-&gt;reason[sizeof(se-&gt;reason)-1] = '\0';
+    } else {
+        se-&gt;reason[0] = '\0';
+    }
+    // UI is non-critical → use margin=1 and GC if it can’t be posted right now
+    if (!QACTIVE_POST_X(AO_Nextion, &amp;se-&gt;super, QF_NO_MARGIN, &amp;me-&gt;super)) {
+        QF_gc(&amp;se-&gt;super);
+    }</code>
+    </operation>
+    <operation name="make_details(NextionDetailsEvt *de, const BmsTelemetry *t)" type="void" visibility="0x02" properties="0x01">
+     <code>// Voltages
+    if (t-&gt;high_cell_V &gt;= 2.0f &amp;&amp; t-&gt;high_cell_V &lt;= 4.6f)
+        de-&gt;high_voltage_V = t-&gt;high_cell_V;
+    if (t-&gt;low_cell_V &gt;= 2.0f &amp;&amp; t-&gt;low_cell_V &lt;= 4.6f)
+        de-&gt;low_voltage_V  = t-&gt;low_cell_V;
+    // For &quot;avg&quot;, we don't have per-cell average; use array voltage as a coarse overall indicator
+    de-&gt;avg_voltage_V  = t-&gt;array_voltage_V;
+
+    // Temps
+    de-&gt;high_temp_C      = t-&gt;sys_temp_high_C;
+    de-&gt;low_temp_C       = t-&gt;sys_temp_low_C;
+    de-&gt;pack_high_temp_C = t-&gt;sys_temp_high_C; // you don't have separate pack temps
+    de-&gt;pack_low_temp_C  = t-&gt;sys_temp_low_C;
+
+    // Serial, FW (you only have a 32-bit firmware_version, not major/minor/patch)
+    snprintf(de-&gt;serial_number, sizeof(de-&gt;serial_number), &quot;%lu&quot;, (unsigned long)t-&gt;serial_number);
+    snprintf(de-&gt;firmware, sizeof(de-&gt;firmware), &quot;%lu&quot;, (unsigned long)t-&gt;firmware_version);
+
+    // Fan + SoC
+    de-&gt;fan_speed_rpm = t-&gt;fan_rpm;
+    de-&gt;soc_percent   = t-&gt;soc_percent;
+    de-&gt;soc2_percent  = t-&gt;soc_percent; // you don't have a second SoC; mirror main SoC
+
+    // State + Fault text
+    strncpy(de-&gt;bms_state_str,
+        BMS_state_to_text(t-&gt;battery_type_code, t-&gt;bms_state),
+        sizeof(de-&gt;bms_state_str)-1);
+    de-&gt;bms_state_str[sizeof(de-&gt;bms_state_str)-1] = '\0';
+
+    if (t-&gt;bms_fault == 0U) {
+        strcpy(de-&gt;bms_fault_str, &quot;None&quot;);
+    } else {
+        char reasons[128];
+        BmsSeverity sev;
+        decode_faults_for_ui(t, reasons, sizeof(reasons), &amp;sev);
+        strncpy(de-&gt;bms_fault_str, reasons, sizeof(de-&gt;bms_fault_str)-1);
+        de-&gt;bms_fault_str[sizeof(de-&gt;bms_fault_str)-1] = '\0';
+        snprintf(de-&gt;bms_fault_str, sizeof(de-&gt;bms_fault_str), &quot;0x%02X&quot;, t-&gt;bms_fault);
+    }</code>
+    </operation>
+    <operation name="make_summary(NextionSummaryEvt *se, const BmsTelemetry *t)" type="void" visibility="0x02" properties="0x01">
+     <code>// pack voltage
+    se-&gt;packV = t-&gt;array_voltage_V;
+
+    // pass through numeric code for HMI color mapping
+    se-&gt;battery_type_code = t-&gt;battery_type_code ? t-&gt;battery_type_code : 0x0000;
+
+    // friendly name + a fallback color (RGB565) in case you still use typeColor565
+    switch (t-&gt;battery_type_code) {
+        case 0x0600: // 600s family (Ocado extended)
+            strcpy(se-&gt;battTypeStr, &quot;600s&quot;);
+            se-&gt;typeColor565 = 0xFD20; // orange
+            break;
+
+        case 0x0500: // 500s Hyperdrive (J1939)
+            strcpy(se-&gt;battTypeStr, &quot;500s Hyperdrive&quot;);
+            se-&gt;typeColor565 = 0xFFE0; // yellow
+            break;
+
+        case 0x0501: // 500s BMZ (extended)
+            strcpy(se-&gt;battTypeStr, &quot;500s BMZ&quot;);
+            se-&gt;typeColor565 = 0xFD20; // orange (or pick a distinct amber if you prefer)
+            break;
+
+        case 0x0401: // 400s Dual-Zone
+            strcpy(se-&gt;battTypeStr, &quot;400s Dual-Zone&quot;);
+            se-&gt;typeColor565 = 0x07FF; // teal/cyan
+            break;
+
+        case 0x0402: // 400s Steatite
+            strcpy(se-&gt;battTypeStr, &quot;400s Steatite&quot;);
+            se-&gt;typeColor565 = 0x001F; // blue
+            break;
+
+        case 0x0400: // 400s Hyperdrive (base)
+            strcpy(se-&gt;battTypeStr, &quot;400s Hyperdrive&quot;);
+            se-&gt;typeColor565 = 0x07E0; // green
+            break;
+
+        default:
+            strcpy(se-&gt;battTypeStr, &quot;Unknown&quot;);
+            se-&gt;typeColor565 = 0xC618; // neutral grey
+            break;
+    }
+
+    // status text
+    strncpy(se-&gt;statusStr,
+        BMS_state_to_text(t-&gt;battery_type_code, t-&gt;bms_state),
+        sizeof(se-&gt;statusStr)-1);
+    se-&gt;statusStr[sizeof(se-&gt;statusStr)-1] = '\0';
+
+#if !defined(ENABLE_BMS_SIM)
+    {
+        BattClassResult cr = batt_classify(t, /*bms_sim_active=*/false);
+        strncpy(se-&gt;classStr, cr.label, sizeof(se-&gt;classStr) - 1);
+        se-&gt;classStr[sizeof(se-&gt;classStr) - 1] = '\0';
+        se-&gt;classColor565 = cr.color565;
+        /* RGB565: 0xFC00 ≈ (255,128,0) — vivid orange */
+        if ((cr.cls == BATT_CLASS_RECOVERABLE) ||
+            (strcmp(cr.label, &quot;Recoverable&quot;) == 0)) {
+            se-&gt;classColor565 = 0xFC00;
+            }
+    }
+
+#else
+{
+    // SIM build – don’t classify
+    strcpy(se-&gt;classStr, &quot;SIMULATOR&quot;);
+    se-&gt;classColor565 = 0xC618; // grey
+}
+#endif
+
+    // errors/warnings (you only have bms_fault bitfield right now)
+    char faults[128];
+    BmsSeverity sev;
+    decode_faults_for_ui(t, faults, sizeof(faults), &amp;sev);
+
+    // Put the text into the one-line errors field for pMain.
+    // Keep it short if you want: you can clip or pick the first item.
+    if (strcmp(faults, &quot;None&quot;) == 0) {
+        se-&gt;errors[0] = '\0';              // Nextion code prints &quot;None&quot; itself
+        se-&gt;warnIcon  = 0U;
+    } else {
+        strncpy(se-&gt;errors, faults, sizeof(se-&gt;errors)-1);
+        se-&gt;errors[sizeof(se-&gt;errors)-1] = '\0';
+        se-&gt;warnIcon = (sev &gt;= BMS_SEV_WARNING) ? 1U : 0U;
+    }
+    se-&gt;recoverable = (t-&gt;bms_fault == 0U) ? 1U : 0U;         // you don't have a recoverable bit yet
+    se-&gt;charging    = 0U;         // caller sets this if needed
+    se-&gt;statusColor565 = 0U;      // leave 0 if you don’t tint the status label
+    se-&gt;reason[0] = '\0';</code>
+    </operation>
+    <operation name="ui_ok_now_det(void)" type="bool" visibility="0x02" properties="0x00">
+     <code>uint32_t now = HAL_GetTick();
+    if ((now - s_last_det_ms) &lt; 250U) return false;  // ~4 Hz max
+    s_last_det_ms = now; return true;</code>
+    </operation>
+    <operation name="ui_ok_now_sum(void)" type="bool" visibility="0x02" properties="0x01">
+     <code>uint32_t now = HAL_GetTick();
+    if ((now - s_last_sum_ms) &lt; 120U) return false;  // ~8 Hz max
+    s_last_sum_ms = now; return true;</code>
+    </operation>
+    <operation name="hash_details(const BmsTelemetry *t)" type="uint32_t" visibility="0x00" properties="0x01">
+     <code>uint32_t h = 0x85EBCA6Bu;
+    h ^= (uint32_t)qV005(t-&gt;array_voltage_V); h = rotl32(h, 7);
+    h ^= (uint32_t)qV005(t-&gt;high_cell_V);     h = rotl32(h, 7);
+    h ^= (uint32_t)qV005(t-&gt;low_cell_V);      h = rotl32(h, 7);
+    h ^= (uint32_t)qT1(t-&gt;sys_temp_high_C);   h = rotl32(h, 7);
+    h ^= (uint32_t)qT1(t-&gt;sys_temp_low_C);    h = rotl32(h, 7);
+    h ^= (uint32_t)t-&gt;fan_rpm;                h = rotl32(h, 7);
+    h ^= (uint32_t)t-&gt;soc_percent;            h = rotl32(h, 7);
+    h ^= (uint32_t)t-&gt;bms_state;              h = rotl32(h, 7);
+    h ^= (uint32_t)t-&gt;bms_fault;              h = rotl32(h, 7);
+    h ^= (uint32_t)t-&gt;last_error_class;       h = rotl32(h, 7);
+    h ^= (uint32_t)t-&gt;last_error_code;        h = rotl32(h, 7);
+    h ^= (uint32_t)t-&gt;battery_type_code;      h = rotl32(h, 7);
+    h ^= (uint32_t)qA01_dA(t-&gt;current_dA);    h = rotl32(h, 7);
+    h ^= (uint32_t)(t-&gt;serial_number ^ t-&gt;firmware_version);
+    return h;</code>
+    </operation>
+    <operation name="hash_summary(const BmsTelemetry *t, bool charging, char const *reason)" type="uint32_t" visibility="0x02" properties="0x01">
+     <code>uint32_t h = 0x9E3779B9u;
+    h ^= (uint32_t)t-&gt;battery_type_code; h = rotl32(h, 7);
+    h ^= (uint32_t)qV005(t-&gt;array_voltage_V); h = rotl32(h, 7);
+    h ^= (uint32_t)t-&gt;bms_state;         h = rotl32(h, 7);
+    h ^= (uint32_t)t-&gt;bms_fault;         h = rotl32(h, 7);
+    h ^= (uint32_t)t-&gt;soc_percent;       h = rotl32(h, 7);
+    h ^= (uint32_t)(charging ? 1u : 0u); h = rotl32(h, 7);
+    if (reason &amp;&amp; reason[0]) {
+        for (char const *p = reason; *p; ++p) { h ^= (uint8_t)*p; h = rotl32(h, 5); }
+    }
+    return h;</code>
+    </operation>
+    <operation name="decode_faults_for_ui(const BmsTelemetry *t,&#10;                                 char *out_text, size_t out_len,&#10;BmsSeverity *out_sev)" type="void" visibility="0x02" properties="0x01">
+     <code>if (!t || !out_text || out_len == 0) return;
+    out_text[0] = '\0';
+    if (out_sev) *out_sev = BMS_SEV_NONE;
+
+    BmsSeverity    sev = BMS_SEV_NONE;
+    BmsDomainMask  dom = BMS_DOM_NONE;
+
+    switch (t-&gt;battery_type_code) {
+        case 0x0500: { // 500s Hyperdrive (J1939)
+            bms_decode_hyp500(
+                /* hw_fault      */ t-&gt;bms_fault_raw,      // your parse fills this from 0x18FF0300 byte0
+                /* error_sev_raw */ t-&gt;last_error_class,   // from 0x18FF0E00
+                /* error_code    */ t-&gt;last_error_code,    // from 0x18FF0E00
+                out_text, out_len, &amp;sev, &amp;dom);
+        } break;
+
+        case 0x0501:   // 500s BMZ (extended)
+        case 0x0600: { // 600s CP (extended)
+            bms_decode_bmz500_cp600(
+                /* pack_fault */ t-&gt;bms_fault_raw,     // from 0x10000010 byte5 in your parse
+                out_text, out_len, &amp;sev, &amp;dom);
+        } break;
+
+        case 0x0400:   // 400s Hyperdrive (base)
+        case 0x0401:   // 400s Dual-Zone
+        case 0x0402: { // 400s Steatite
+            /* We don’t have all the detailed boolean flags yet; use what we have.
+               Map last_error_class into a coarse “master fault code”, and mark
+               the usual suspects as false for now. You can refine these as you
+               parse more 400s bits. */
+            BmsCp400Input in = {0};
+            /* Coarse mapping:
+               0=Normal, 1=Warning, 2=Fault, 3=Permanent, 4=HW Fault (per header comment) */
+            if (t-&gt;last_error_class) {
+                in.master_fault_code = t-&gt;last_error_class;
+            } else if (t-&gt;bms_fault) {
+                in.master_fault_code = 2; // any fault present -&gt; “Fault”
+            } else {
+                in.master_fault_code = 0; // Normal
+            }
+            in.uv = in.ov = in.ot = in.ut = false;
+            in.dchg_oc = in.chg_oc = false;
+            in.therm_warning = false;
+            in.imbalance = false;
+
+            bms_decode_cp400(&amp;in, out_text, out_len, &amp;sev, &amp;dom);
+        } break;
+
+        default: {
+            /* Generic fallback through the unified entry point. Build a best-effort input. */
+            BmsDecodeInput in = {0};
+            in.family = fam_from_code(t-&gt;battery_type_code);
+            switch (in.family) {
+                case BMS_FAM_HYP500:
+                    in.u.hyp500.hw_fault       = t-&gt;bms_fault_raw;
+                    in.u.hyp500.error_severity = t-&gt;last_error_class;
+                    in.u.hyp500.error_code     = t-&gt;last_error_code;
+                    break;
+                case BMS_FAM_BMZ500:
+                case BMS_FAM_CP600:
+                    in.u.bmz_cp600.pack_fault  = t-&gt;bms_fault_raw;
+                    break;
+                case BMS_FAM_CP400_CHILL:
+                case BMS_FAM_CP400_DUAL: {
+                    BmsCp400Input c = {0};
+                    if (t-&gt;last_error_class) c.master_fault_code = t-&gt;last_error_class;
+                    else if (t-&gt;bms_fault)   c.master_fault_code = 2;
+                    else                      c.master_fault_code = 0;
+                    in.u.cp400 = c;
+                    break;
+                }
+                default:
+                    break;
+            }
+            bms_decode_any(&amp;in, out_text, out_len, &amp;sev, &amp;dom);
+        } break;
+    }
+
+    if (out_sev) *out_sev = sev;
+
+    if (out_text[0] == '\0') {
+        strncpy(out_text, &quot;None&quot;, out_len - 1);
+        out_text[out_len - 1] = '\0';
+    }</code>
+    </operation>
+    <operation name="fam_from_code(uint16_t code)" type="BmsBatteryFamily" visibility="0x02" properties="0x01">
+     <code>switch (code) {
+        case 0x0500: return BMS_FAM_HYP500;         // 500s Hyperdrive (J1939)
+        case 0x0501: return BMS_FAM_BMZ500;         // 500s BMZ (extended)
+        case 0x0600: return BMS_FAM_CP600;          // 600s CP (extended)
+        case 0x0401: return BMS_FAM_CP400_DUAL;     // 400s Dual-Zone
+        case 0x0402: return BMS_FAM_CP400_CHILL;    // 400s Steatite (treat as chill-only)
+        case 0x0400: /* fall-through */
+        default:     return BMS_FAM_CP400_CHILL;    // generic 400s
+    }</code>
+    </operation>
+    <statechart properties="0x00">
+     <initial target="../2">
+      <action brief="Ctl_initial">(void)e;
+    me-&gt;page     = 1U;   // start at pWait after splash
+    me-&gt;haveData = 0U;
+    memset(&amp;me-&gt;last, 0, sizeof(me-&gt;last));
+    me-&gt;psu_present = 0U;
+    me-&gt;psu_out_on  = 0U;
+    me-&gt;psu_v_out   = 0.0f;
+    me-&gt;psu_i_out   = 0.0f;
+    me-&gt;psu_temp    = 0.0f;
+    //QTimeEvt_disarm(&amp;me-&gt;tBmsWatch);
+    /* subscribe AFTER we’re started */
+    QActive_subscribe(&amp;me-&gt;super, BMS_UPDATED_SIG);
+    QActive_subscribe(&amp;me-&gt;super, BMS_NO_BATTERY_SIG);
+    QActive_subscribe(&amp;me-&gt;super, BMS_CONN_LOST_SIG);
+
+#ifdef ENABLE_BMS_SIM
+    // every 500 ms (adjust as you like)
+    QTimeEvt_armX(&amp;me-&gt;simTick, BSP_TICKS_PER_SEC/2, BSP_TICKS_PER_SEC/2);
+#endif</action>
+      <initial_glyph conn="10,6,5,1,65,10,-2">
+       <action box="0,-2,25,2"/>
+      </initial_glyph>
+     </initial>
+     <initial target="../2/3">
+      <action brief="Q_INIT_SIG">/*
+(void)e;
+    me-&gt;page     = 1U;   // start at pWait after splash
+    me-&gt;haveData = 0U;
+    memset(&amp;me-&gt;last, 0, sizeof(me-&gt;last));
+    me-&gt;psu_present = 0U;
+    me-&gt;psu_out_on  = 0U;
+    me-&gt;psu_v_out   = 0.0f;
+    me-&gt;psu_i_out   = 0.0f;
+    me-&gt;psu_temp    = 0.0f;
+    //QTimeEvt_disarm(&amp;me-&gt;tBmsWatch);
+    /* subscribe AFTER we’re started */ /*
+    QActive_subscribe(&amp;me-&gt;super, BMS_UPDATED_SIG);
+    QActive_subscribe(&amp;me-&gt;super, BMS_NO_BATTERY_SIG);
+    QActive_subscribe(&amp;me-&gt;super, BMS_CONN_LOST_SIG);
+#ifdef ENABLE_BMS_SIM
+    // every 500 ms (adjust as you like)
+    QTimeEvt_armX(&amp;me-&gt;simTick, BSP_TICKS_PER_SEC/2, BSP_TICKS_PER_SEC/2);
+#endif
+*/</action>
+      <initial_glyph conn="12,18,5,1,33,18,-2">
+       <action box="0,-2,15,3"/>
+      </initial_glyph>
+     </initial>
+     <state name="Ctl_run">
+      <tran trig="Q_ENTRY_SIG">
+       <action brief="Q_ENTRY_SIG">/* Ctl_run::ENTRY */
+#ifdef ENABLE_BMS_SIM
+    BmsSim_tick();        // generates &amp; posts a BMS_UPDATED_SIG with plausible data
+#endif
+if (!me-&gt;haveData) {
+    post_page_ex(me, 1U); /* pWait */
+} else {
+    post_page_ex(me, 2U); /* pMain, forces summary/psu repaint */
+}</action>
+       <tran_glyph conn="12,21,3,-1,29">
+        <action box="0,-2,13,2"/>
+       </tran_glyph>
+      </tran>
+      <tran trig="SIM_TICK_SIG" target="../4">
+       <tran_glyph conn="12,24,3,1,35,38,-5">
+        <action box="0,-2,13,2"/>
+       </tran_glyph>
+      </tran>
+      <tran trig="BMS_CONN_LOST_SIG" target="../5">
+       <tran_glyph conn="12,28,3,1,37,89,-7">
+        <action box="0,-2,19,2"/>
+       </tran_glyph>
+      </tran>
+      <state name="Ctl_wait">
+       <documentation>“pWait→pMain on first BMS_UPDATED_SIG; post summary+details on pMain.”</documentation>
+       <entry>/* Ctl_wait::ENTRY */
+post_page_ex(me, 1U);  /* pWait */
+me-&gt;state = CTL_STATE_WAIT;</entry>
+       <tran trig="BMS_UPDATED_SIG">
+        <action>/* Ctl_wait -- BMS_UPDATED_SIG (internal) */
+BmsTelemetryEvt const *be = Q_EVT_CAST(BmsTelemetryEvt);
+me-&gt;last = be-&gt;data; 
+me-&gt;haveData = 1U;
+
+if (me-&gt;page == 1U) {          /* if we were on pWait */
+    post_page_ex(me, 2U);      /* switch to pMain and force repaint */
+}
+/* On pMain, push compact view; details on demand */
+post_summary(me, false, &quot;ready to charge&quot;);
+post_details(me);</action>
+        <tran_glyph conn="19,41,3,-1,19">
+         <action box="0,-2,17,2"/>
+        </tran_glyph>
+       </tran>
+       <tran trig="BMS_NO_BATTERY_SIG">
+        <action>/* Ctl_wait -- BMS_NO_BATTERY_SIG / BMS_CONN_LOST_SIG (internal) */
+me-&gt;haveData = 0U;
+if (me-&gt;page == 3U) post_page_ex(me, 2U);  /* leave pDetails */
+if (me-&gt;page == 2U) post_comms_lost(me);   /* show banner */</action>
+        <tran_glyph conn="19,44,3,-1,21">
+         <action box="0,-2,20,3"/>
+        </tran_glyph>
+       </tran>
+       <tran trig="BMS_CONN_LOST_SIG">
+        <action>/* Ctl_wait -- BMS_NO_BATTERY_SIG / BMS_CONN_LOST_SIG (internal) */
+me-&gt;haveData = 0U;
+if (me-&gt;page == 3U) post_page_ex(me, 2U);  /* leave pDetails */
+if (me-&gt;page == 2U) post_comms_lost(me);   /* show banner */</action>
+        <tran_glyph conn="19,48,3,-1,21">
+         <action box="0,-2,19,2"/>
+        </tran_glyph>
+       </tran>
+       <state_glyph node="19,35,24,20">
+        <entry box="0,3,6,2"/>
+       </state_glyph>
+      </state>
+      <state name="Ctl_detect">
+       <documentation>“idle-with-data; periodic UI every 2s via ui2s; BTN starts charge if fresh &amp; PSU OK.”</documentation>
+       <entry>/* Ctl_detect::ENTRY */
+me-&gt;state = CTL_STATE_DETECT;
+/* if you want a periodic summary while waiting, arm ui2s (2s): */
+QTimeEvt_armX(&amp;me-&gt;ui2s, 2U*BSP_TICKS_PER_SEC, 2U*BSP_TICKS_PER_SEC);
+post_summary(me, false, &quot;ready to charge&quot;);</entry>
+       <exit>QTimeEvt_disarm(&amp;me-&gt;ui2s);</exit>
+       <tran trig="Q_ENTRY_SIG">
+        <tran_glyph conn="19,64,3,-1,16">
+         <action box="0,-2,10,2"/>
+        </tran_glyph>
+       </tran>
+       <tran trig="Q_EXIT_SIG">
+        <tran_glyph conn="19,67,3,-1,16">
+         <action box="0,-2,10,2"/>
+        </tran_glyph>
+       </tran>
+       <tran trig="TIMEOUT_SIG">
+        <action>/* periodic UI refresh */
+        if (!me-&gt;haveData) { return Q_HANDLED(); }  // nothing fresh → don’t overwrite banner
+
+        if (me-&gt;page == 3U) {
+            post_details(me);
+        } else if (me-&gt;page == 2U) {
+            post_summary(me, false, 0);
+        }
+        printf(&quot;pMain: V=%.2fV type=0x%04X state=%u soc=%u recoverable=%u reason=\&quot;%s\&quot;\r\n&quot;,
+                   (double)me-&gt;last.array_voltage_V,
+                   (unsigned)me-&gt;last.battery_type_code,
+                   (unsigned)me-&gt;last.bms_state,
+                   (unsigned)me-&gt;last.soc_percent,
+                   (unsigned)(me-&gt;last.bms_fault==0U),
+                   &quot;ready to charge&quot;);
+        return Q_HANDLED();</action>
+        <tran_glyph conn="19,71,3,-1,18">
+         <action box="0,-2,13,2"/>
+        </tran_glyph>
+       </tran>
+       <tran trig="BUTTON_PRESSED_SIG" target="../../6">
+        <action>/* Transition Effect: Ctl_detect --[BUTTON_PRESSED_SIG]--&gt; Ctl_charge */
+uint32_t now = HAL_GetTick();
+bool fresh = (me-&gt;haveData &amp;&amp; (now - last_bms_ms) &lt;= 1500U);  /* 1.5 s window */
+if (!fresh) {
+    post_comms_lost(me);
+    Q_TRAN_DISPATCH(&amp;Ctl_detect);    /* block transition */
+    return;
+}
+if (!Cotek_isPresent()) {
+    post_summary(me, false, &quot;PSU not present/error&quot;);
+    Q_TRAN_DISPATCH(&amp;Ctl_detect);
+    return;
+}
+/* fall through: allow transition */
+#if !defined(ENABLE_BMS_SIM)
+        // === REAL BATTERIES ONLY (no SIM) ===
+        // if (!me-&gt;haveData) {
+        //     post_summary(me, false, &quot;No BMS data&quot;);
+        //     return Q_HANDLED();
+        // }
+
+        BattClassResult cr = batt_classify(&amp;me-&gt;last, /*bms_sim_active=*/false);
+
+        if (cr.cls == BATT_CLASS_NOT_RECOVERABLE) {
+            post_summary(me, false, &quot;Not Recoverable – charging blocked&quot;);
+            return Q_HANDLED();
+        } else if (cr.cls == BATT_CLASS_RECOVERABLE || cr.cls == BATT_CLASS_OPERATIONAL) {
+            printf(&quot;Ctl_detect transition to Ctl_charge\r\n&quot;);
+            return Q_TRAN(&amp;Ctl_charge);
+        } else {
+            post_summary(me, false, &quot;Unknown status – cannot start&quot;);
+            return Q_HANDLED();
+        }
+#else
+        // === SIM BUILD === (keep previous behaviour)
+        if (me-&gt;haveData) {
+            printf(&quot;Ctl_detect transition to Ctl_charge\r\n&quot;);
+            return Q_TRAN(&amp;Ctl_charge);
+        } else {
+            post_summary(me, false, &quot;No BMS data&quot;);
+            return Q_HANDLED();
+        }
+#endif</action>
+        <tran_glyph conn="19,74,3,1,26,15,-2">
+         <action box="0,-2,10,2"/>
+        </tran_glyph>
+       </tran>
+       <tran trig="BMS_UPDATED_SIG">
+        <action>BmsTelemetryEvt const *be = Q_EVT_CAST(BmsTelemetryEvt);
+me-&gt;last = be-&gt;data; me-&gt;haveData = 1U;
+post_summary(me, false, &quot;ready to charge&quot;);
+post_details(me);</action>
+        <tran_glyph conn="19,76,3,-1,18">
+         <action box="0,-2,10,2"/>
+        </tran_glyph>
+       </tran>
+       <tran trig="BMS_CONN_LOST_SIG">
+        <action>me-&gt;haveData = 0U;
+        // If user is on pDetails, switch to pMain
+if (me-&gt;page == 3U) {
+    post_page_ex(me, 2U);   // pMain
+}
+
+        // If user is on pMain, or we just switched to it, post comms-lost banner
+if (me-&gt;page == 2U) {
+    post_comms_lost(me);
+}
+return Q_HANDLED();</action>
+        <tran_glyph conn="19,78,3,-1,18">
+         <action box="0,-2,10,2"/>
+        </tran_glyph>
+       </tran>
+       <state_glyph node="19,60,23,21">
+        <entry box="0,3,6,2"/>
+        <exit box="0,5,6,2"/>
+       </state_glyph>
+      </state>
+      <state name="Ctl_poweringDown">
+       <documentation>“send PSU_OFF; arm tPsuOff; return to wait on PSU_RSP_STATUS_SIG or guard TO.”</documentation>
+       <entry>/* Ctl_poweringDown::ENTRY */
+QEvt *off = Q_NEW(QEvt, PSU_REQ_OFF_SIG);
+if (!QACTIVE_POST_X(AO_Cotek, off, 1U, 0U)) { QF_gc(off); }
+QTimeEvt_armX(&amp;me-&gt;tPsuOff, BSP_TICKS_PER_SEC / 5U, 0U);
+post_summary(me, false, &quot;stopping...&quot;);
+return Q_HANDLED();</entry>
+       <tran trig="Q_ENTRY_SIG">
+        <tran_glyph conn="19,120,3,-1,18">
+         <action box="0,-2,14,2"/>
+        </tran_glyph>
+       </tran>
+       <tran trig="PSU_RSP_STATUS_SIG" target="../../4">
+        <action>// Check the status “output disabled?”
+            CotekStatusEvt const *se = (CotekStatusEvt const *)e;
+            bool output_is_on = false;
+
+            output_is_on = (se-&gt;out_on != 0U);
+
+            if (!output_is_on) {
+                // OFF confirmed → now safe to say OFF and leave the substate
+                /* cancel the wait timer */
+                post_psu_to_hmi(/*present=*/1U, /*output_on=*/0U,
+                se-&gt;v_out, se-&gt;i_out, se-&gt;t_out);
+                QTimeEvt_disarm(&amp;me-&gt;tPsuOff);
+                post_summary(me, false, &quot;power off confirmed&quot;);
+                return Q_TRAN(&amp;Ctl_detect);</action>
+        <tran_glyph conn="19,123,3,1,32,-59,-9">
+         <action box="0,-2,20,2"/>
+        </tran_glyph>
+       </tran>
+       <tran trig="PSU_OFF_WAIT_TO_SIG">
+        <action>// Didn’t see OFF yet; re-issue OFF and keep waiting.
+            (void)QACTIVE_POST_X(AO_Cotek, Q_NEW(QEvt, PSU_REQ_OFF_SIG), 1U, 0U);
+            QTimeEvt_rearm(&amp;me-&gt;tPsuOff, BSP_TICKS_PER_SEC / 5U);
+            return Q_HANDLED();</action>
+        <tran_glyph conn="19,126,3,-1,20">
+         <action box="0,-2,19,2"/>
+        </tran_glyph>
+       </tran>
+       <tran trig="Q_EXIT_SIG">
+        <action>// Stop the watchdog timer cleanly
+            QTimeEvt_disarm(&amp;me-&gt;tPsuOff);
+            return Q_HANDLED();</action>
+        <tran_glyph conn="19,129,3,-1,20">
+         <action box="0,-2,10,2"/>
+        </tran_glyph>
+       </tran>
+       <state_glyph node="19,115,23,29">
+        <entry box="0,3,6,2"/>
+       </state_glyph>
+      </state>
+      <state name="Ctl_charge">
+       <documentation>“arm tCharge (30s); post setpoint to Cotek; exit on BTN/timeout/lost-comms.”</documentation>
+       <entry>me-&gt;state = CTL_STATE_CHARGE;
+in_charge = true;
+#if !defined(ENABLE_BMS_SIM)
+        // === REAL BATTERIES ONLY ===
+        BattClassResult cr = batt_classify(&amp;me-&gt;last, /*bms_sim_active=*/false);
+
+        float v_set = 48.0f;
+        float i_set = 0.0f;
+
+        if (cr.cls == BATT_CLASS_NOT_RECOVERABLE) {
+            post_summary(me, false, &quot;Blocked: Not Recoverable&quot;);
+            return Q_TRAN(&amp;Ctl_detect);  // do not arm timer, do not command PSU
+        } else if (cr.cls == BATT_CLASS_RECOVERABLE) {
+            i_set = 1.0f;  // 48V / 1A
+        } else if (cr.cls == BATT_CLASS_OPERATIONAL) {
+            i_set = 3.0f;  // 48V / 3A
+        } else {
+            post_summary(me, false, &quot;Unknown class – cannot charge&quot;);
+            return Q_TRAN(&amp;Ctl_detect);
+        }
+#else
+        // === SIM BUILD === (previous default used in your code)
+        float v_set = 12.0f;
+        float i_set = 1.0f;
+#endif
+
+        printf(&quot;CTL: start charging V=%.1f I=%.1f (30s)\r\n&quot;, (double)v_set, (double)i_set);
+
+        PsuSetEvt *se = Q_NEW(PsuSetEvt, PSU_REQ_SETPOINT_SIG);
+        se-&gt;voltSet = v_set;
+        se-&gt;currSet = i_set;
+        if (!QACTIVE_POST_X(AO_Cotek, &amp;se-&gt;super, QF_NO_MARGIN, 0U)) {
+            QF_gc(&amp;se-&gt;super);
+        }
+        post_summary(me, true, &quot;charging&quot;);
+        QTimeEvt_armX(&amp;me-&gt;tCharge, 30U * BSP_TICKS_PER_SEC, 0U);
+        return Q_HANDLED();</entry>
+       <exit>in_charge = false;
+        printf(&quot;Ctl_charge: exit\r\n&quot;);
+        QTimeEvt_disarm(&amp;me-&gt;tCharge);
+        return Q_HANDLED();</exit>
+       <tran trig="Q_ENTRY_SIG">
+        <action>BmsTelemetryEvt const *be = Q_EVT_CAST(BmsTelemetryEvt);
+        me-&gt;last = be-&gt;data; me-&gt;haveData = 1U;
+
+        /* guard: temp &lt; 35C and no new errors */
+        if (me-&gt;last.sys_temp_high_C &gt; 35.0f || me-&gt;last.last_error_class) {
+            QEvt *off = Q_NEW(QEvt, PSU_REQ_OFF_SIG);
+            // UI/PSU requests are “best effort”: use margin 0U and GC if it can’t be queued right now
+            if (!QACTIVE_POST_X(AO_Cotek, off, QF_NO_MARGIN, 0U)) {
+                QF_gc(off);
+            }
+            post_summary(me, false,
+                (me-&gt;last.sys_temp_high_C &gt; 35.0f) ? &quot;Stopped: temp &gt; 35C&quot;
+                                                   : &quot;Stopped: new error&quot;);
+            printf(&quot;Ctl_charge: BMS_UPDATE_SIG - High temp or error detected\r\n&quot;);
+            return Q_TRAN(&amp;Ctl_detect);
+        }
+        /* refresh UI while charging */
+        post_summary(me, true, &quot;charging&quot;);
+return Q_HANDLED();</action>
+        <tran_glyph conn="18,92,3,-1,19">
+         <action box="0,-2,14,2"/>
+        </tran_glyph>
+       </tran>
+       <tran trig="BMS_UPDATED_SIG">
+        <tran_glyph conn="18,95,3,-1,19">
+         <action box="0,-2,17,3"/>
+        </tran_glyph>
+       </tran>
+       <tran trig="BUTTON_PRESSED_SIG" target="../../5">
+        <action>// or BUTTON_RELEASED_SIG if you prefer
+
+        post_summary(me, false, &quot;Stopped: user&quot;);
+        /* 1) ask PSU to turn OFF */
+        QEvt *off = Q_NEW(QEvt, PSU_REQ_OFF_SIG);
+        // UI/PSU requests are “best effort”: use margin 0U and GC if it can’t be queued right now
+        if (!QACTIVE_POST_X(AO_Cotek, off, QF_NO_MARGIN, 0U)) {
+            QF_gc(off);
+        }
+        /* 3) go wait for confirmation */
+        return Q_TRAN(&amp;Ctl_poweringDown);</action>
+        <tran_glyph conn="18,99,3,1,27,20,-3">
+         <action box="0,-2,20,2"/>
+        </tran_glyph>
+       </tran>
+       <tran trig="CHARGE_TIMEOUT_SIG" target="../../5">
+        <action>            printf(&quot;Ctl_charge: Charge_timeout_sig\r\n&quot;);
+            // Ask PSU to turn OFF, then wait for confirmation in the substate
+            QEvt *off = Q_NEW(QEvt, PSU_REQ_OFF_SIG);
+            if (!QACTIVE_POST_X(AO_Cotek, off, QF_NO_MARGIN, 0U)) {
+                QF_gc(off);
+            }
+            post_summary(me, false, &quot;Stopped: 30s timeout&quot;);
+            return Q_TRAN(&amp;Ctl_poweringDown);</action>
+        <tran_glyph conn="18,102,3,1,26,19,-2">
+         <action box="0,-2,21,2"/>
+        </tran_glyph>
+       </tran>
+       <tran trig="BMS_CONN_LOST_SIG" target="../../5">
+        <action>post_summary(me, false, &quot;Stopped: BMS lost&quot;);
+            // ensure page and comms-lost banner + warn icon
+if (me-&gt;page == 3U) { post_page_ex(me, 2U); }
+post_comms_lost(me);
+            /* 1) ask PSU to turn OFF */
+QEvt *off = Q_NEW(QEvt, PSU_REQ_OFF_SIG);
+            // UI/PSU requests are “best effort”: use margin 0U and GC if it can’t be queued right now
+if (!QACTIVE_POST_X(AO_Cotek, off, QF_NO_MARGIN, 0U)) {
+     QF_gc(off);
+}
+            /* 2) start short timeout (e.g., 500 ms) as a guard */
+QTimeEvt_armX(&amp;me-&gt;tPsuOff, 50U, 0U);   /* assuming your tick is 10ms */
+            /* 3) go wait for confirmation */
+return Q_TRAN(&amp;Ctl_poweringDown);</action>
+        <tran_glyph conn="18,106,3,1,28,19,-4">
+         <action box="0,-2,20,2"/>
+        </tran_glyph>
+       </tran>
+       <state_glyph node="18,88,25,25">
+        <entry box="0,3,6,2"/>
+        <exit box="0,5,6,2"/>
+       </state_glyph>
+      </state>
+      <state_glyph node="12,14,61,136"/>
+     </state>
+     <state_diagram size="111,151"/>
+    </statechart>
+   </class>
+   <attribute name="g_lastSig" type="uint16_t" visibility="0x01" properties="0x00">
+    <code>extern volatile uint16_t g_lastSig;</code>
+   </attribute>
+   <attribute name="g_lastTag" type="uint8_t" visibility="0x01" properties="0x00">
+    <code>extern volatile uint8_t  g_lastTag;</code>
+   </attribute>
+   <attribute name="in_charge" type="bool" visibility="0x01" properties="0x00">
+    <code>static bool in_charge;</code>
+   </attribute>
+   <attribute name="s_last_sum_ms" type="uint32_t" visibility="0x01" properties="0x00">
+    <code>static uint32_t s_last_sum_ms;</code>
+   </attribute>
+   <attribute name="s_last_det_ms" type="uint32_t" visibility="0x00" properties="0x00">
+    <code>static uint32_t s_last_det_ms;</code>
+   </attribute>
+   <attribute name="s_last_sum_hash" type="uint32_t" visibility="0x01" properties="0x00">
+    <code>static uint32_t s_last_sum_hash;</code>
+   </attribute>
+   <attribute name="s_last_det_hash" type="uint32_t" visibility="0x01" properties="0x00">
+    <code>static uint32_t s_last_det_hash;</code>
+   </attribute>
+   <attribute name="last_bms_ms" type="uint32_t" visibility="0x01" properties="0x00">
+    <code>static uint32_t last_bms_ms;</code>
+   </attribute>
+   <operation name="ctor" type="void" visibility="0x01" properties="0x00">
+    <code>#ifdef ENABLE_BMS_SIM
+    QTimeEvt_ctorX(&amp;l_ctl.simTick, &amp;l_ctl.super, SIM_TICK_SIG, 0U);
+#endif
+    QActive_ctor(&amp;l_ctl.super, Q_STATE_CAST(&amp;Ctl_initial));
+    QTimeEvt_ctorX(&amp;l_ctl.tBmsWatch, &amp;l_ctl.super, BMS_WATCHDOG_TO_SIG, 0U);
+    QTimeEvt_ctorX(&amp;l_ctl.ui2s,   &amp;l_ctl.super, TIMEOUT_SIG, 0U);
+    QTimeEvt_ctorX(&amp;l_ctl.tCharge, &amp;l_ctl.super, CHARGE_TIMEOUT_SIG, 0U);
+    QTimeEvt_ctorX(&amp;l_ctl.tPsuOff, &amp;l_ctl.super, PSU_OFF_WAIT_TO_SIG, 0U);
+</code>
+   </operation>
+  </package>
+  <package name="nextion" stereotype="0x00">
+   <class name="Nextion" superclass="qpc::QActive">
+    <documentation>prio 5</documentation>
+    <attribute name="super" type="QActive" visibility="0x02" properties="0x00"/>
+    <statechart properties="0x00">
+     <initial target="../1">
+      <action brief="Nex_initial">(void)e;
+    /* Nothing heavy here (no reset/FW writes). Runtime only. */</action>
+      <initial_glyph conn="8,3,5,1,46,11,-2">
+       <action box="0,-2,17,2"/>
+      </initial_glyph>
+     </initial>
+     <state name="Nex_active">
+      <tran trig="Q_ENTRY_SIG">
+       <action>/* tell Controller we are alive */
+            if (!QACTIVE_POST_X(AO_Controller, Q_NEW(QEvt, NEX_READY_SIG), 1U, 0U)) {
+                /* nothing to GC because we used Q_NEW inline; this will almost never drop */
+            }
+            return Q_HANDLED();</action>
+       <tran_glyph conn="8,17,3,-1,37">
+        <action box="0,-2,16,2"/>
+       </tran_glyph>
+      </tran>
+      <tran trig="NEX_REQ_SHOW_PAGE_SIG">
+       <action>/* 0=splash,1=wait,2=main,3=details */
+            NextionPageEvt const *pe = (NextionPageEvt const*)e;
+            switch (pe-&gt;page) {
+            case 0: nex_send3(&quot;page pSplash&quot;);  printf(&quot;NEX: page pSplash\n&quot;);  break;
+            case 1: nex_send3(&quot;page pWait&quot;);    printf(&quot;NEX: page pWait\n&quot;);    break;
+                case 2: nex_send3(&quot;page pMain&quot;);
+                    printf(&quot;NEX: page pMain\n&quot;);    // ensure warning icon starts hidden each time we arrive on pMain
+                    nex_send3(&quot;vis pMain.pWarn,0&quot;);
+                    nex_send3(&quot;ref pMain.pWarn&quot;);
+                    break;
+            case 3: nex_send3(&quot;page pDetails&quot;); printf(&quot;NEX: page pDetails\n&quot;); break;
+            default: break;
+            }
+
+            return Q_HANDLED();</action>
+       <tran_glyph conn="8,22,3,-1,37">
+        <action box="0,-2,24,2"/>
+       </tran_glyph>
+      </tran>
+      <tran trig="NEX_REQ_UPDATE_SUMMARY_SIG">
+       <action>NextionSummaryEvt const *se = Q_EVT_CAST(NextionSummaryEvt);
+
+            // Battery type text and color bar
+            if (se-&gt;battTypeStr[0] != '\0') {
+                nex_send_textf(&quot;pMain.tBattType.txt=\&quot;Battery: %s\&quot;&quot;, se-&gt;battTypeStr);
+                nex_sendf      (&quot;pMain.rTypeBar.bco=%u&quot;, (unsigned)se-&gt;typeColor565);
+            }
+        // show classification label/color (on real batteries it will be Operational/Recoverable/Not Recoverable;
+        // on SIM builds it will show &quot;SIM&quot; in grey)
+        nex_send_textf(&quot;pMain.tRecHead.txt=\&quot;%s\&quot;&quot;, se-&gt;classStr);
+        nex_sendf      (&quot;pMain.tRecHead.pco=%u&quot;, (unsigned)se-&gt;classColor565);
+        nex_send3(&quot;ref pMain.tRecHead&quot;);
+
+            // Pack voltage
+            nex_send_textf(&quot;pMain.tVolt.txt=\&quot;%.2f V\&quot;&quot;, se-&gt;packV);
+
+            // Status text (no color usage -&gt; you can leave statusColor565 unused)
+            if (se-&gt;statusStr[0] != '\0') {
+                nex_send_textf(&quot;pMain.tStatus.txt=\&quot;%s\&quot;&quot;, se-&gt;statusStr);
+                // If you later choose to color the status text or bar:
+                // nex_sendf(&quot;pMain.rStBar.bco=%u&quot;, (unsigned)se-&gt;statusColor565);
+            }
+
+            // Errors line (or &quot;None&quot;)
+            if (se-&gt;errors[0] != '\0') {
+                nex_send_textf(&quot;pMain.tErrors.txt=\&quot;%s\&quot;&quot;, se-&gt;errors);
+            } else {
+                nex_send_textf(&quot;pMain.tErrors.txt=\&quot;None\&quot;&quot;);
+            }
+
+            // Warning icon group visibility
+
+        const uint8_t want = se-&gt;warnIcon ? 1U : 0U;
+        nex_send_textf(&quot;vis pMain.pWarn,%u&quot;, want);
+        nex_send3(&quot;ref pMain.pWarn&quot;);
+
+        // if (want) {
+        //     nex_send3(&quot;pMain.pWarn.pic=3&quot;);   // your real icon ID
+        //     nex_send3(&quot;vis pMain.pWarn,1&quot;);
+        // } else {
+        //     nex_send3(&quot;pMain.pWarn.pic=0&quot;);   // empty / nothing
+        //     nex_send3(&quot;vis pMain.pWarn,0&quot;);
+        // }
+        // nex_send3(&quot;ref pMain.pWarn&quot;);
+        // nex_send3(&quot;get pMain.pWarn.pic&quot;);     // optional: should be 0 or 2
+        // nex_send3(&quot;get pMain.pWarn.vis&quot;);     // optional: should be 0 or 1
+
+        // debug trace
+        printf(&quot;NEX: pWarn vis=%u (charging=%u, warnIcon=%u)\r\n&quot;,
+               (unsigned)want, (unsigned)se-&gt;charging, (unsigned)se-&gt;warnIcon);
+
+#ifdef ENABLE_BMS_SIM
+            // Set tRecReason text
+            char cmd[128];
+            snprintf(cmd, sizeof(cmd), &quot;pMain.tAppStatus.txt=\&quot;%s\&quot;&quot;, (se-&gt;reason[0] ? se-&gt;reason : &quot;&quot;));
+            nex_send_textf(&quot;%s&quot;, cmd);
+
+            // Set background color: green=2016 when charging, else a neutral default (e.g., 63488=red? 50712=grey?)
+            if (se-&gt;charging) {
+                nex_send3(&quot;pMain.tAppStatus.bco=2016&quot;);
+            } else {
+                nex_send3(&quot;pMain.tAppStatus.bco=50712&quot;); // pick your normal background; adjust if you use another
+            }
+
+            // ensure Nextion refreshes the component
+            nex_send3(&quot;ref pMain.tAppStatus&quot;);
+            return Q_HANDLED();
+
+#endif
+        if (se-&gt;reason[0] != '\0') {
+            nex_send_textf(&quot;pMain.tRecReason.txt=\&quot;%s\&quot;&quot;, se-&gt;reason);
+        } else {
+            nex_send_textf(&quot;pMain.tRecReason.txt=\&quot;\&quot;&quot;);
+        }
+        return Q_HANDLED();</action>
+       <tran_glyph conn="8,27,3,-1,37">
+        <action box="0,-2,29,2"/>
+       </tran_glyph>
+      </tran>
+      <tran trig="NEX_REQ_UPDATE_PSU_SIG">
+       <action>NextionPsuEvt const *pe = Q_EVT_CAST(NextionPsuEvt);
+
+        nex_send_textf(&quot;pMain.tPsu.txt=\&quot;PSU: %s\&quot;&quot;, pe-&gt;present ? &quot;Detected&quot; : &quot;Missing&quot;);
+        nex_send_textf(&quot;pMain.tOutState.txt=\&quot;Output: %s\&quot;&quot;, pe-&gt;output_on ? &quot;ON&quot; : &quot;OFF&quot;);
+        if (pe-&gt;v_out &gt;= 0.0f)  nex_send_textf(&quot;pMain.tOutV.txt=\&quot;Vout: %.1f V\&quot;&quot;, pe-&gt;v_out);
+        if (pe-&gt;i_out &gt;= 0.0f)  nex_send_textf(&quot;pMain.tOutI.txt=\&quot;Iout: %.1f A\&quot;&quot;, pe-&gt;i_out);
+        if (pe-&gt;temp_C &gt; -90.0f &amp;&amp; pe-&gt;temp_C &lt; 200.0f)
+            nex_send_textf(&quot;pMain.tOutT.txt=\&quot;Temp: %.0f C\&quot;&quot;, pe-&gt;temp_C);  // ASCII only
+        // colors can stay with nex_sendf
+        nex_sendf(&quot;pMain.tPsu.bco=%u&quot;,      pe-&gt;present   ? 2016U : 63488U);
+        nex_sendf(&quot;pMain.tOutState.bco=%u&quot;, pe-&gt;output_on ? 2016U : 63488U);
+
+        return Q_HANDLED();</action>
+       <tran_glyph conn="8,31,3,-1,37">
+        <action box="0,-2,28,2"/>
+       </tran_glyph>
+      </tran>
+      <tran trig="NEX_REQ_UPDATE_DETAILS_SIG">
+       <action>NextionDetailsEvt const *de = Q_EVT_CAST(NextionDetailsEvt);
+
+            // voltage
+            nex_send_textf(&quot;pDetails.tHVolt.txt=\&quot;%.2f\&quot;&quot;, de-&gt;high_voltage_V);
+            nex_send_textf(&quot;pDetails.tLVolt.txt=\&quot;%.2f\&quot;&quot;, de-&gt;low_voltage_V);
+            nex_send_textf(&quot;pDetails.tAVolt.txt=\&quot;%.2f\&quot;&quot;, de-&gt;avg_voltage_V);
+
+            // temps
+            nex_send_textf(&quot;pDetails.tHTemp.txt=\&quot;%.1f\&quot;&quot;, de-&gt;high_temp_C);
+            nex_send_textf(&quot;pDetails.tLTemp.txt=\&quot;%.1f\&quot;&quot;, de-&gt;low_temp_C);
+            nex_send_textf(&quot;pDetails.tPackHTemp.txt=\&quot;%.1f\&quot;&quot;, de-&gt;pack_high_temp_C);
+            nex_send_textf(&quot;pDetails.tPackLTemp.txt=\&quot;%.1f\&quot;&quot;, de-&gt;pack_low_temp_C);
+
+            // serial, FW
+            nex_send_textf(&quot;pDetails.tSerialN.txt=\&quot;%s\&quot;&quot;, de-&gt;serial_number);
+            nex_send_textf(&quot;pDetails.tFW.txt=\&quot;%s\&quot;&quot;,      de-&gt;firmware);
+
+            // fan / soc
+            nex_sendf(&quot;pDetails.tFanSpeed.txt=\&quot;%u\&quot;&quot;, (unsigned)de-&gt;fan_speed_rpm);
+            nex_sendf(&quot;pDetails.tSoC.txt=\&quot;%u%%\&quot;&quot;,    (unsigned)de-&gt;soc_percent);
+            nex_sendf(&quot;pDetails.tSoC2.txt=\&quot;%u%%\&quot;&quot;,   (unsigned)de-&gt;soc2_percent);
+
+            // state / fault
+            nex_send_textf(&quot;pDetails.tBmsState.txt=\&quot;%s\&quot;&quot;, de-&gt;bms_state_str);
+            nex_send_textf(&quot;pDetails.tBmsFault.txt=\&quot;BMS_fault: %s\&quot;&quot;, de-&gt;bms_fault_str);
+
+            return Q_HANDLED();</action>
+       <tran_glyph conn="8,36,3,-1,37">
+        <action box="0,-2,28,2"/>
+       </tran_glyph>
+      </tran>
+      <state_glyph node="8,10,44,37"/>
+     </state>
+     <state_diagram size="80,50"/>
+    </statechart>
+   </class>
+   <operation name="ctor" type="void" visibility="0x00" properties="0x00">
+    <code>QActive_ctor(&amp;l_nex.super, Q_STATE_CAST(&amp;Nex_initial));</code>
+   </operation>
+  </package>
+  <package name="bms" stereotype="0x00">
+   <class name="Bms" superclass="qpc::QActive">
+    <documentation>prio 3</documentation>
+    <attribute name="super" type="QActive" visibility="0x02" properties="0x00"/>
+    <attribute name="tick" type="QTimeEvt" visibility="0x02" properties="0x00"/>
+    <attribute name="snap" type="BmsTelemetry" visibility="0x02" properties="0x00"/>
+    <attribute name="have_any_data" type="uint8_t" visibility="0x02" properties="0x00"/>
+    <attribute name="tick10" type="uint32_t" visibility="0x02" properties="0x00"/>
+    <attribute name="last_rx_ticks" type="uint32_t" visibility="0x02" properties="0x00"/>
+    <attribute name="pub_div" type="uint16_t" visibility="0x02" properties="0x00"/>
+    <attribute name="comms_lost_sent" type="uint8_t" visibility="0x02" properties="0x00"/>
+    <operation name="BMS_publish_telemetry(BmsTelemetry const *t)" type="void" visibility="0x02" properties="0x00">
+     <code>/* keep the AO snapshot current (used by GetSnapshot, etc.) */
+    l_bms.snap = *t;
+    l_bms.have_any_data = 1U;
+
+    BmsTelemetryEvt *be = Q_NEW(BmsTelemetryEvt, BMS_UPDATED_SIG);
+    be-&gt;data = *t;  /* copy */
+
+    /* post to Controller with margin=1; GC if queue is temporarily full */
+    if (!QACTIVE_POST_X(AO_Controller, &amp;be-&gt;super, 1U, 0U)) {
+        QF_gc(&amp;be-&gt;super);
+    }</code>
+    </operation>
+    <operation name="*bms_type_str(uint16_t code)" type="const char" visibility="0x02" properties="0x01">
+     <code>switch (code) {
+        case 0x0600: return &quot;600s&quot;;
+        case 0x0500: return &quot;500s Hyperdrive&quot;;
+        case 0x0501: return &quot;500s BMZ&quot;;
+        case 0x0400: return &quot;400s Hyperdrive&quot;;
+        case 0x0401: return &quot;400s Dual-Zone&quot;;
+        case 0x0402: return &quot;400s Steatite&quot;;
+        default:     return &quot;Unknown&quot;;
+    }</code>
+    </operation>
+    <operation name="bms_maybe_log_type(uint16_t new_code)" type="void" visibility="0x02" properties="0x01">
+     <code>static uint16_t s_last_logged_code = 0;
+    if (new_code != 0 &amp;&amp; new_code != s_last_logged_code) {
+        s_last_logged_code = new_code;
+        printf(&quot;BMS: detected battery type: %s (0x%04X)\r\n&quot;,
+               bms_type_str(new_code), new_code);
+    }</code>
+    </operation>
+    <operation name="BMS_ParseFrame(CanFrameEvt const *f, BmsTelemetry *b)" type="int32_t" visibility="0x00" properties="0x00">
+     <code>uint32_t id  = f-&gt;id;
+    uint8_t  dlc = f-&gt;dlc;
+    uint8_t const *d = f-&gt;data;
+
+    /* ===================== 600s family (Ocado 0x100000xx, extended) ===================== */
+    /* Keep existing mapping; if we see 0x10000010 later we will classify as BMZ 500s. */
+    if ((id &amp; 0xFFFF0000u) == 0x10000000u) {
+        /* If we haven't chosen a 500s-BMZ subtype yet, default this extended block to 600s. */
+        if (b-&gt;battery_type_code == 0) {
+            /* Will be overridden to 0x0501 if we see 0x10000010 (BMZ) */
+            b-&gt;battery_type_code = 0x0600;
+            bms_maybe_log_type(b-&gt;battery_type_code);
+        }
+
+        switch (id) {
+            case 0x10000090u: /* Pack ID &amp; FW (Serial + FW) */
+                if (dlc &gt;= 8) {
+                    b-&gt;serial_number    = be32(&amp;d[0]);
+                    b-&gt;firmware_version = be32(&amp;d[4]);
+                }
+                return 1;
+
+            case 0x10000110u: /* Temperatures (0.1°C) */
+                if (dlc &gt;= 4) {
+                    int16_t th = be16s(&amp;d[0]);
+                    int16_t tl = be16s(&amp;d[2]);
+                    b-&gt;sys_temp_high_C = (float)th * 0.1f;
+                    b-&gt;sys_temp_low_C  = (float)tl * 0.1f;
+                }
+                return 1;
+
+            case 0x10000020u: /* Charging params / SOC (%) */
+                if (dlc &gt;= 4) {
+                    b-&gt;soc_percent = d[3]; /* 0..100 or 0xFF unknown */
+                }
+                return 1;
+
+            default: ; /* fall-through to allow BMZ handling below */
+        }
+    }
+
+    /* ===================== 500s BMZ (extended 0x100000xx) ===================== */
+    /* Presence of 0x10000010 indicates the BMZ flavour of the extended scheme. */
+    if (id == 0x10000010u) { /* Pack status &amp; power + battery type */
+        if (b-&gt;battery_type_code == 0 || b-&gt;battery_type_code == 0x0600) {
+            b-&gt;battery_type_code = 0x0501; /* 500s BMZ sub-type */
+            bms_maybe_log_type(b-&gt;battery_type_code);
+        }
+        if (dlc &gt;= 8) {
+            /* V, I, state, fault, type (per doc) */
+            uint16_t v10 = be16(&amp;d[0]);          /* 0.1 V/bit */
+            int16_t  i10 = (int16_t)be16(&amp;d[2]); /* 0.1 A/bit, sign: + = charging */
+            (void)i10; /* placeholder for future current field */
+
+            b-&gt;array_voltage_V = (float)v10 * 0.1f;
+            b-&gt;bms_state       = d[4];                 /* enum */
+            b-&gt;bms_fault       = (d[5] != 0U) ? 1U : 0U; /* any bit -&gt; fault present */
+            b-&gt;bms_fault_raw   = d[5];
+
+            /* d[6] is &quot;Battery Type&quot; enumeration in BMZ doc; optional to store */
+            printf(&quot;BMS: BMZ state=%s fault=%s (raw=0x%02X)\r\n&quot;,
+                   BMS_state_to_text(b-&gt;battery_type_code, b-&gt;bms_state),
+                   b-&gt;bms_fault ? &quot;YES&quot;:&quot;NO&quot;, (unsigned)b-&gt;bms_fault);
+        }
+        return 1;
+    }
+    if ((id &amp; 0xFFFF0000u) == 0x10000000u &amp;&amp; b-&gt;battery_type_code == 0x0501) {
+        switch (id) {
+            case 0x10000020u: /* SOC etc. */
+                if (dlc &gt;= 4) b-&gt;soc_percent = d[3];
+                return 1;
+
+            case 0x10000100u: /* Highest/Lowest cell mV */
+                if (dlc &gt;= 4) {
+                    b-&gt;high_cell_V = (float)be16(&amp;d[0]) * 0.001f;
+                    b-&gt;low_cell_V  = (float)be16(&amp;d[2]) * 0.001f;
+                }
+                return 1;
+
+            case 0x10000110u: /* Temps 0.1°C */
+                if (dlc &gt;= 4) {
+                    int16_t th = be16s(&amp;d[0]);
+                    int16_t tl = be16s(&amp;d[2]);
+                    b-&gt;sys_temp_high_C = (float)th * 0.1f;
+                    b-&gt;sys_temp_low_C  = (float)tl * 0.1f;
+                }
+                return 1;
+
+            case 0x10000090u: /* Serial + FW */
+                if (dlc &gt;= 8) {
+                    b-&gt;serial_number    = be32(&amp;d[0]);
+                    b-&gt;firmware_version = be32(&amp;d[4]);
+                }
+                return 1;
+
+            default: ;
+        }
+    }
+
+    /* ===================== 500s Hyperdrive (J1939 0x18FFxx00) ===================== */
+    if ((id &amp; 0xFFFF00FFu) == 0x18FF0000u) {
+        if (b-&gt;battery_type_code == 0) {
+            b-&gt;battery_type_code = 0x0500;
+            bms_maybe_log_type(b-&gt;battery_type_code);
+        }
+
+        switch (id) {
+            case 0x18FF4000u: /* Serial + FW (32/32-bit BE) */
+                if (dlc &gt;= 8) {
+                    b-&gt;serial_number    = be32(&amp;d[0]);
+                    b-&gt;firmware_version = be32(&amp;d[4]);
+                }
+                return 1;
+
+            case 0x18FF0300u: /* State/fault */
+                if (dlc &gt;= 2) {
+                    b-&gt;bms_fault = d[0];
+                    b-&gt;bms_fault_raw = d[0];
+                    uint8_t s = d[1];
+                    switch (s) {
+                        case 0: case 1: case 2: case 3:
+                        case 4: case 5: case 62: case 63:
+                            b-&gt;bms_state = s;                // accept known states
+                            break;
+                        default:
+                            /* ignore unknown/placeholder states like 0x7F/0xFF */
+                            /* leave b-&gt;bms_state unchanged */
+                            break;
+                    }
+
+                    printf(&quot;BMS: state=%s fault=0x%02X\r\n&quot;,
+                           BMS_state_to_text(b-&gt;battery_type_code, b-&gt;bms_state),
+                           (unsigned)b-&gt;bms_fault);
+                }
+                return 1;
+
+            case 0x18FF0600u: {           // High/Low cell voltage (mV) for 500s Hyperdrive
+                if (dlc &gt;= 8) {
+                    uint16_t hi_mv = be16(&amp;d[4]);
+                    uint16_t lo_mv = be16(&amp;d[6]);
+                    float hi = hi_mv * 0.001f;   // mV -&gt; V
+                    float lo = lo_mv * 0.001f;
+
+                    // sanity clamp (Li-ion)
+                    if (hi &gt;= 2.0f &amp;&amp; hi &lt;= 4.6f) b-&gt;high_cell_V = hi;
+                    if (lo &gt;= 2.0f &amp;&amp; lo &lt;= 4.6f) b-&gt;low_cell_V  = lo;
+                }
+                return 1;
+            }
+
+
+            case 0x18FF0700u: /* Array/pack voltage 0.1 V/LSB */
+                if (dlc &gt;= 2) b-&gt;array_voltage_V = (float)be16(&amp;d[0]) * 0.1f;
+                return 1;
+
+            case 0x18FFE000u: /* SOC % */
+                if (dlc &gt;= 1) b-&gt;soc_percent = d[0];
+                return 1;
+
+            case 0x18FF0800u: /* System temps 0.1°C/LSB */
+                if (dlc &gt;= 4) {
+                    b-&gt;sys_temp_high_C = (float)be16s(&amp;d[0]) * 0.1f;
+                    b-&gt;sys_temp_low_C  = (float)be16s(&amp;d[2]) * 0.1f;
+                }
+                return 1;
+
+            case 0x18FF5000u: /* Fan RPM */
+                if (dlc &gt;= 2) b-&gt;fan_rpm = be16(&amp;d[0]);
+                return 1;
+
+            case 0x18FF0E00u: /* Last error class/code */
+                if (dlc &gt;= 2) {
+                    b-&gt;last_error_class = d[0];
+                    b-&gt;last_error_code  = d[1];
+                }
+                return 1;
+
+            default: ;
+        }
+    }
+
+    /* ===================== 400s family (Custom Power: Dual-Zone / Steatite) ===================== */
+    if ( (id == 0x18070800u) || (id == 0x18060800u) || (id == 0x180C0800u)
+      || (id == 0x18000800u) || (id == 0x18010800u)
+      || (id == 0x18040A00u)
+      || ((id &amp; 0xFFFFFF00u) == 0x18000800u)
+      || ((id &amp; 0xFFFFFF00u) == 0x18010800u) ) {
+
+        if (b-&gt;battery_type_code == 0) {
+            b-&gt;battery_type_code = 0x0400;
+            bms_maybe_log_type(b-&gt;battery_type_code);
+        }
+
+        if ((id &amp; 0x000000FFu) == 0x01u) {
+            if ((b-&gt;battery_type_code &amp; 0xFF00u) == 0x0400u &amp;&amp; b-&gt;battery_type_code != 0x0401) {
+                b-&gt;battery_type_code = 0x0401; /* Dual-Zone tentative */
+                bms_maybe_log_type(b-&gt;battery_type_code);
+            }
+        }
+
+        switch (id) {
+            case 0x18070800u: /* STATUS_1: SOC, etc. */
+                if (dlc &gt;= 7) {
+                    b-&gt;soc_percent = d[6] ? d[6] : d[5];
+                }
+                return 1;
+
+            case 0x18060800u: /* STATUS_0: min/max cell V overall (BE mV) */
+                if (dlc &gt;= 4) {
+                    float vmax = (float)be16(&amp;d[0]) * 0.001f;
+                    float vmin = (float)be16(&amp;d[2]) * 0.001f;
+                    if (vmax &gt; 0.1f &amp;&amp; vmax &gt; b-&gt;high_cell_V) b-&gt;high_cell_V = vmax;
+                    if (vmin &gt; 0.1f &amp;&amp; (b-&gt;low_cell_V == 0.0f || vmin &lt; b-&gt;low_cell_V)) b-&gt;low_cell_V = vmin;
+                }
+                return 1;
+
+            case 0x180C0800u: /* TEMPERATURE_SUMMARY: max/min temps (signed 8-bit) */
+                if (dlc &gt;= 4) {
+                    b-&gt;sys_temp_high_C = (float)((int8_t)d[0]);
+                    b-&gt;sys_temp_low_C  = (float)((int8_t)d[1]);
+                }
+                return 1;
+
+            case 0x18000800u: /* CELL_VOLTAGE_A */
+            case 0x18010800u: /* CELL_VOLTAGE_B */
+            {
+                if (dlc &gt;= 2) {
+                    for (int i = 0; i + 1 &lt; dlc; i += 2) {
+                        float v = (float)be16(&amp;d[i]) * 0.001f;
+                        if (v &gt; 0.1f) {
+                            if (v &gt; b-&gt;high_cell_V) b-&gt;high_cell_V = v;
+                            if (b-&gt;low_cell_V == 0.0f || v &lt; b-&gt;low_cell_V) b-&gt;low_cell_V = v;
+                        }
+                    }
+                }
+                return 1;
+            }
+
+            case 0x18040A00u: /* PARAMETERS_4: UID, FW, Battery Type */
+                if (dlc &gt;= 2) {
+                    uint16_t type_be = (dlc &gt;= 8) ? be16(&amp;d[6]) : be16(&amp;d[dlc - 2]);
+                    if (type_be == 0x0020u) {
+                        if (b-&gt;battery_type_code != 0x0402) {
+                            b-&gt;battery_type_code = 0x0402;   /* Steatite */
+                            bms_maybe_log_type(b-&gt;battery_type_code);
+                        }
+                    } else {
+                        /* keep current subtype */
+                    }
+                }
+                return 1;
+
+            default: ;
+        }
+    }
+
+    /* ===================== 400s legacy fallbacks ===================== */
+    if ( (id == 0x18070800u) || (id == 0x18060800u) || (id == 0x180C0800u)
+      || ((id &amp; 0xFFFFF0FFu) == 0x18004000u) ) {
+        if (b-&gt;battery_type_code == 0) {
+            b-&gt;battery_type_code = 0x0400;
+            bms_maybe_log_type(b-&gt;battery_type_code);
+        }
+
+        switch (id) {
+            case 0x18070800u:
+                if (dlc &gt;= 7) {
+                    uint8_t faultBit = (d[2] &gt;&gt; 6) &amp; 0x01u;
+                    b-&gt;bms_fault  = faultBit ? 1U : 0U;
+                    b-&gt;bms_fault_raw = 0U;   // &lt;--- keep 0, no raw byte defined for this family here
+                    b-&gt;bms_state  = d[3];
+                    b-&gt;soc_percent = d[6] ? d[6] : d[5];
+                    printf(&quot;BMS: state=%s fault=%s\r\n&quot;,
+                           BMS_state_to_text(b-&gt;battery_type_code, b-&gt;bms_state),
+                           b-&gt;bms_fault ? &quot;YES&quot;:&quot;NO&quot;);
+                }
+                return 1;
+
+            case 0x18060800u:
+                if (dlc &gt;= 4) {
+                    b-&gt;sys_temp_high_C = (float)((int8_t)d[2]);
+                    b-&gt;sys_temp_low_C  = (float)((int8_t)d[3]);
+                }
+                return 1;
+
+            case 0x180C0800u:
+                if (dlc &gt;= 3) {
+                    b-&gt;last_error_class = d[1];
+                    b-&gt;last_error_code  = d[2];
+                    if (b-&gt;last_error_class || b-&gt;last_error_code) b-&gt;bms_fault = 1U;
+                }
+                return 1;
+
+            default:
+                if ((id &amp; 0xFFFFF0FFu) == 0x18004000u &amp;&amp; dlc &gt;= 6) {
+                    float c1 = (float)be16(&amp;d[0]) * 0.001f;
+                    float c2 = (float)be16(&amp;d[2]) * 0.001f;
+                    float c3 = (float)be16(&amp;d[4]) * 0.001f;
+                    if (c1 &gt; 0.1f) { if (b-&gt;high_cell_V &lt; c1) b-&gt;high_cell_V = c1; if (b-&gt;low_cell_V == 0 || b-&gt;low_cell_V &gt; c1) b-&gt;low_cell_V = c1; }
+                    if (c2 &gt; 0.1f) { if (b-&gt;high_cell_V &lt; c2) b-&gt;high_cell_V = c2; if (b-&gt;low_cell_V == 0 || b-&gt;low_cell_V &gt; c2) b-&gt;low_cell_V = c2; }
+                    if (c3 &gt; 0.1f) { if (b-&gt;high_cell_V &lt; c3) b-&gt;high_cell_V = c3; if (b-&gt;low_cell_V == 0 || b-&gt;low_cell_V &gt; c3) b-&gt;low_cell_V = c3; }
+                    return 1;
+                }
+                break;
+        }
+    }
+
+    return 0;</code>
+    </operation>
+    <statechart properties="0x00">
+     <initial target="../1">
+      <action brief="Bms_initial">(void)par;
+    memset(&amp;me-&gt;snap, 0, sizeof(me-&gt;snap));
+    me-&gt;have_any_data = 0U;
+    me-&gt;tick10        = 0U;
+    me-&gt;last_rx_ticks = 0U;
+    me-&gt;pub_div       = 0U;
+    me-&gt;comms_lost_sent = 0U;
+
+    QActive_subscribe(&amp;me-&gt;super, CAN_RX_SIG);
+
+    /* 10Hz internal tick */
+    printf(&quot;BMS: initial, arming tick\r\n&quot;);
+    QTimeEvt_armX(&amp;me-&gt;tick, BSP_TICKS_PER_SEC/10U, BSP_TICKS_PER_SEC/10U);
+</action>
+      <initial_glyph conn="4,3,5,1,61,7,-2">
+       <action box="0,-2,10,2"/>
+      </initial_glyph>
+     </initial>
+     <state name="Bms_active">
+      <tran trig="CAN_RX_SIG">
+       <action>CanFrameEvt const *ce = Q_EVT_CAST(CanFrameEvt);
+        if (BMS_ParseFrame(ce, &amp;me-&gt;snap)) {
+            printf(&quot;BMS: frame parsed (id=0x%lX, ext=%u, dlc=%u)\r\n&quot;,
+                   (unsigned long)ce-&gt;id, ce-&gt;isExt, ce-&gt;dlc);
+            me-&gt;have_any_data = 1U;
+            me-&gt;last_rx_ticks = me-&gt;tick10;
+            me-&gt;comms_lost_sent = 0U;        // NEW: we’re alive again; allow future detection
+        }
+        return Q_HANDLED();</action>
+       <tran_glyph conn="6,15,3,-1,35">
+        <action box="0,-2,16,2"/>
+       </tran_glyph>
+      </tran>
+      <tran trig="BMS_TICK_SIG">
+       <action>me-&gt;tick10++;
+#ifndef ENABLE_BMS_SIM
+        /* --- Lost-comms detection: no fresh frames for 2s --- */
+        if (me-&gt;have_any_data) {
+            uint32_t age = me-&gt;tick10 - me-&gt;last_rx_ticks;  // uint32_t math is wrap-safe
+            if (!me-&gt;comms_lost_sent &amp;&amp; age &gt;= BMS_LOST_TICKS) {
+                // Tell the Controller (it will stop charging, force pMain, and show the banner)
+                if (!QACTIVE_POST_X(AO_Controller, Q_NEW(QEvt, BMS_CONN_LOST_SIG), 1U, &amp;me-&gt;super)) {
+                    /* nothing to GC; Q_NEW was inlined */
+                }
+                me-&gt;comms_lost_sent = 1U;   // ensure we only announce once per outage
+                // (deliberately keep have_any_data=1 so we know we had a battery before)
+            }
+        }
+#endif
+        /* ===== Publish cadence: 2 Hz (every 0.5 s) =====
+           10 Hz tick -&gt; publish every 5 ticks */
+        if (++me-&gt;pub_div &gt;= 5U) {
+            me-&gt;pub_div = 0U;
+
+            if (me-&gt;have_any_data &amp;&amp; !me-&gt;comms_lost_sent) {
+                BmsTelemetryEvt *be = Q_NEW(BmsTelemetryEvt, BMS_UPDATED_SIG);
+                be-&gt;data = me-&gt;snap;
+                if (!QACTIVE_POST_X(AO_Controller, &amp;be-&gt;super, 1U, &amp;me-&gt;super)) {
+                    QF_gc(&amp;be-&gt;super);
+                }
+            } else if (!me-&gt;have_any_data) {
+                (void)QACTIVE_POST_X(AO_Controller,
+                                     Q_NEW(QEvt, BMS_NO_BATTERY_SIG), 1U, &amp;me-&gt;super);
+            }
+        }
+        return Q_HANDLED();</action>
+       <tran_glyph conn="6,21,3,-1,35">
+        <action box="0,-2,15,2"/>
+       </tran_glyph>
+      </tran>
+      <state_glyph node="6,6,57,31"/>
+     </state>
+     <state_diagram size="90,125"/>
+    </statechart>
+   </class>
+   <operation name="ctor" type="void" visibility="0x00" properties="0x00">
+    <code>QActive_ctor(&amp;l_bms.super, Q_STATE_CAST(&amp;Bms_initial));
+QTimeEvt_ctorX(&amp;l_bms.tick, &amp;l_bms.super, BMS_TICK_SIG, 0U);</code>
+   </operation>
+  </package>
+  <package name="cotek" stereotype="0x00">
+   <class name="Cotek" superclass="qpc::QActive">
+    <documentation>prio 2</documentation>
+    <attribute name="super" type="QActive" visibility="0x02" properties="0x00"/>
+    <attribute name="on" type="uint8_t" visibility="0x02" properties="0x00"/>
+    <attribute name="vset" type="float" visibility="0x02" properties="0x00"/>
+    <attribute name="iset" type="float" visibility="0x02" properties="0x00"/>
+    <attribute name="tick" type="QTimeEvt" visibility="0x02" properties="0x00"/>
+    <attribute name="alive_ms" type="uint8_t" visibility="0x02" properties="0x00"/>
+    <attribute name="present" type="uint8_t" visibility="0x02" properties="0x00"/>
+    <attribute name="out_on" type="uint8_t" visibility="0x02" properties="0x00"/>
+    <attribute name="v_out" type="float" visibility="0x02" properties="0x00"/>
+    <attribute name="i_out" type="float" visibility="0x02" properties="0x00"/>
+    <attribute name="t_out" type="float" visibility="0x02" properties="0x00"/>
+    <attribute name="startup_sync" type="uint8_t" visibility="0x02" properties="0x00"/>
+    <attribute name="off_acks" type="uint8_t" visibility="0x02" properties="0x00"/>
+    <statechart properties="0x00">
+     <initial target="../1">
+      <action brief="Cotek_initial">(void)par;
+    cotek_set_remote_mode();
+    cotek_power_off();
+    me-&gt;on = 0U; me-&gt;vset = 0.f; me-&gt;iset = 0.f;
+    QTimeEvt_ctorX(&amp;me-&gt;tick, &amp;me-&gt;super, COTEK_TICK_SIG, 0U);
+    // start periodic every 500ms
+    QTimeEvt_armX(&amp;me-&gt;tick, 50U, 50U); // assuming 1 tick = 10 ms (adjust to your BSP tick)
+    me-&gt;alive_ms = 1000U;   // start as stale
+    me-&gt;present = 0U;
+    me-&gt;out_on  = 0U;
+    me-&gt;v_out = me-&gt;i_out = me-&gt;t_out = 0.0f;
+    /* start in &quot;startup sync&quot;: confirm real OFF before we publish “OFF” */
+    me-&gt;startup_sync = 1U;
+    me-&gt;off_acks     = 0U;
+    return Q_TRAN(&amp;Cotek_active);</action>
+      <initial_glyph conn="4,2,5,1,34,8,-2">
+       <action box="0,-2,17,2"/>
+      </initial_glyph>
+     </initial>
+     <state name="Cotek_active">
+      <tran trig="COTEK_TICK_SIG">
+       <action>uint16_t rawV = 0, rawI = 0;   uint8_t rawT = 0, ctrl = 0;
+                uint8_t okV = i2c_read_u16(0x60, &amp;rawV);          // V*100
+                uint8_t okI = i2c_read_u16(0x62, &amp;rawI);          // A*100
+                uint8_t okT = i2c_read_u8 (0x68, &amp;rawT);          // °C
+                uint8_t okC = cotek_read_control(&amp;ctrl);          // bit0=ON
+
+                uint8_t okAny = (okV || okI || okT || okC);
+                if (okAny) {
+                    me-&gt;alive_ms = 0U;
+                    if (okV) me-&gt;v_out = (float)rawV / 100.0f;
+                    if (okI) me-&gt;i_out = (float)rawI / 100.0f;
+                    if (okT) me-&gt;t_out = (float)rawT;
+                    if (okC) me-&gt;out_on = ((ctrl &amp; 0x01U) != 0U);  // bit0 = output enable
+                } else {
+                    if (me-&gt;alive_ms &lt; 5000U) { me-&gt;alive_ms += 200U; } // 200 ms tick
+                }
+                uint8_t new_present = (me-&gt;alive_ms &lt;= 1000U) ? 1U : 0U;
+                me-&gt;present = new_present;
+
+                static uint8_t last_present = 0xFFU, last_out_on = 0xFFU;
+                static float   last_v = -999.0f, last_i = -999.0f, last_t = -999.0f;
+
+                if (   (new_present != last_present)
+                    || (me-&gt;out_on   != last_out_on)
+                    || (fabsf(last_v - me-&gt;v_out) &gt; 0.05f)
+                    || (fabsf(last_i - me-&gt;i_out) &gt; 0.05f)
+                    || (fabsf(last_t - me-&gt;t_out) &gt; 0.5f)) {
+
+                    last_present = new_present;
+                    last_out_on  = me-&gt;out_on;
+                    last_v       = me-&gt;v_out;
+                    last_i       = me-&gt;i_out;
+                    last_t       = me-&gt;t_out;
+
+                    post_psu(me, new_present, me-&gt;out_on, me-&gt;v_out, me-&gt;i_out, me-&gt;t_out);
+                    publish_status(me);
+    }
+                    return Q_HANDLED();</action>
+       <tran_glyph conn="4,14,3,-1,28">
+        <action box="0,-2,19,2"/>
+       </tran_glyph>
+      </tran>
+      <tran trig="PSU_REQ_SETPOINT_SIG">
+       <action>// refuse if not present (prevents programming into a bus error)
+                    if (me-&gt;present == 0U) {
+                        printf(&quot;COTEK: IGNORE setpoint (PSU not present)\r\n&quot;);
+                        return Q_HANDLED();
+                    }
+                    PsuSetEvt const *se = Q_EVT_CAST(PsuSetEvt);
+                    me-&gt;vset = se-&gt;voltSet;
+                    me-&gt;iset = se-&gt;currSet;
+                    me-&gt;on = 1U;
+                    /* Program the supply over I2C */
+                    cotek_set_remote_mode();
+                    cotek_set_output_voltage(me-&gt;vset);
+                    cotek_set_output_current(me-&gt;iset);
+                    cotek_commit_settings();
+                    cotek_power_on();
+                    me-&gt;out_on = 1U;
+
+
+            printf(&quot;COTEK: ON V=%.2f I=%.2f\r\n&quot;, me-&gt;vset, me-&gt;iset);
+                    /* Push an immediate UI update so pMain shows PSU group “live” */
+                    post_psu(me,
+                             /*present=*/1U,
+                             /*output_on=*/me-&gt;out_on,
+                             /*v_out=*/me-&gt;vset,   /* show setpoints until readback arrives */
+                             /*i_out=*/0.0f,
+                             /*temp_C=*/NAN);
+
+                    printf(&quot;COTEK: ON V=%.2f I=%.2f\r\n&quot;, me-&gt;vset, me-&gt;iset);
+                    return Q_HANDLED();</action>
+       <tran_glyph conn="4,18,3,-1,28">
+        <action box="0,-2,25,2"/>
+       </tran_glyph>
+      </tran>
+      <tran trig="PSU_REQ_OFF_SIG">
+       <action>me-&gt;on = 0U;
+                    cotek_set_remote_mode();
+                    cotek_power_off();   /* actively command OFF */
+                    printf(&quot;COTEK: OFF\r\n&quot;);
+                    me-&gt;startup_sync = 1U;
+                    me-&gt;off_acks = 0U;
+
+                    return Q_HANDLED();</action>
+       <tran_glyph conn="4,22,3,-1,28">
+        <action box="0,-2,22,2"/>
+       </tran_glyph>
+      </tran>
+      <state_glyph node="4,8,32,34"/>
+     </state>
+     <state_diagram size="80,50"/>
+    </statechart>
+   </class>
+  </package>
+ </package>
+ <package name="Signals" stereotype="0x02">
+  <attribute name="AppSignals" type="enum_t" visibility="0x00" properties="0x00">
+   <code>/* ===== PUBLISHED (must be &lt; MAX_PUB_SIG) ===== */
+CAN_RX_SIG = Q_USER_SIG,   /* ISR → publish; BMS subscribes */
+BMS_UPDATED_SIG,           /* BMS publishes telemetry */
+BMS_NO_BATTERY_SIG,        /* BMS publishes: no pack */
+BMS_CONN_LOST_SIG,         /* BMS publishes: stale data */
+
+/* sentinel that ends “published” range */
+MAX_PUB_SIG,
+
+/* ===== NOT PUBLISHED (direct posts / TEs / internals) ===== */
+BOOT_SIG = MAX_PUB_SIG + 1,
+BMS_TICK_SIG,
+TIMEOUT_SIG,
+BMS_WATCHDOG_TO_SIG,
+CHARGE_TIMEOUT_SIG,
+PSU_OFF_WAIT_TO_SIG,
+SIM_TICK_SIG,
+
+/* HMI */
+NEX_READY_SIG,
+NEX_RX_SIG,
+NEX_REQ_SHOW_PAGE_SIG,
+NEX_REQ_UPDATE_SUMMARY_SIG,
+NEX_REQ_UPDATE_DETAILS_SIG,
+NEX_REQ_UPDATE_PSU_SIG,
+
+/* PSU/Cotek */
+PSU_REQ_SETPOINT_SIG,
+PSU_REQ_OFF_SIG,
+PSU_RSP_STATUS_SIG,
+COTEK_TICK_SIG,
+COTEK_STATUS_SIG,
+
+/* Buttons (BSP ISR) */
+BUTTON_PRESSED_SIG,
+BUTTON_RELEASED_SIG,
+</code>
+  </attribute>
+ </package>
+ <package name="Events" stereotype="0x01">
+  <class name="CanFrameEvt" superclass="qpc::QEvt">
+   <documentation>CanFrameEvt → CAN_RX_SIG</documentation>
+   <attribute name="id" type="uint32_t" visibility="0x02" properties="0x00"/>
+   <attribute name="dlc" type="uint8_t" visibility="0x02" properties="0x00"/>
+   <attribute name="data[8]" type="uint8_t" visibility="0x02" properties="0x00"/>
+   <attribute name="isExt" type="uint8_t" visibility="0x02" properties="0x00"/>
+  </class>
+  <class name="BmsTelemetry" superclass="qpc::QEvt">
+   <attribute name="serial_number" type="uint32_t" visibility="0x02" properties="0x00"/>
+   <attribute name="firmware_version" type="uint32_t" visibility="0x02" properties="0x00"/>
+   <attribute name="bms_state" type="uint8_t" visibility="0x02" properties="0x00"/>
+   <attribute name="bms_fault" type="uint8_t" visibility="0x02" properties="0x00"/>
+   <attribute name="array_voltage_V" type="float" visibility="0x02" properties="0x00"/>
+   <attribute name="high_cell_V" type="float" visibility="0x02" properties="0x00"/>
+   <attribute name="low_cell_V" type="float" visibility="0x02" properties="0x00"/>
+   <attribute name="soc_percent" type="uint8_t" visibility="0x02" properties="0x00"/>
+   <attribute name="sys_temp_high_C" type="float" visibility="0x02" properties="0x00"/>
+   <attribute name="sys_temp_low_C" type="float" visibility="0x02" properties="0x00"/>
+   <attribute name="fan_rpm" type="uint16_t" visibility="0x02" properties="0x00"/>
+   <attribute name="last_error_class" type="uint8_t" visibility="0x02" properties="0x00"/>
+   <attribute name="last_error_code" type="uint8_t" visibility="0x02" properties="0x00"/>
+   <attribute name="bms_fault_raw" type="uint8_t" visibility="0x02" properties="0x00"/>
+   <attribute name="battery_type_code" type="uint16_t" visibility="0x02" properties="0x00"/>
+   <attribute name="current_dA" type="int16_t" visibility="0x02" properties="0x00"/>
+  </class>
+  <class name="BmsTelemetryEvt" superclass="qpc::QEvt">
+   <documentation>BmsTelemetryEvt → BMS_UPDATED_SIG</documentation>
+   <attribute name="super" type="QEvt" visibility="0x02" properties="0x00"/>
+   <attribute name="data" type="BmsTelemetry" visibility="0x02" properties="0x00"/>
+   <attribute name="_pad[8]" type="uint8_t" visibility="0x02" properties="0x00"/>
+  </class>
+  <class name="PsuSetEvt" superclass="qpc::QEvt">
+   <documentation>PsuSetEvt → PSU_REQ_SETPOINT_SIG</documentation>
+   <attribute name="super" type="QEvt" visibility="0x02" properties="0x00"/>
+   <attribute name="voltSet" type="float" visibility="0x02" properties="0x00"/>
+   <attribute name="currSet" type="float" visibility="0x02" properties="0x00"/>
+  </class>
+  <class name="PsuStatusEvt" superclass="qpc::QEvt">
+   <attribute name="super" type="QEvt" visibility="0x02" properties="0x00"/>
+   <attribute name="powerOn" type="bool" visibility="0x02" properties="0x00"/>
+   <attribute name="outV" type="float" visibility="0x02" properties="0x00"/>
+   <attribute name="outI" type="float" visibility="0x02" properties="0x00"/>
+   <attribute name="statusWord" type="uint16_t" visibility="0x02" properties="0x00"/>
+   <attribute name="faultWord" type="uint16_t" visibility="0x02" properties="0x00"/>
+  </class>
+  <class name="CotekStatusEvt" superclass="qpc::QEvt">
+   <documentation>CotekStatusEvt → COTEK_STATUS_SIG / PSU_RSP_STATUS_SIG</documentation>
+   <attribute name="super" type="QEvt" visibility="0x02" properties="0x00"/>
+   <attribute name="present" type="uint8_t" visibility="0x02" properties="0x00"/>
+   <attribute name="out_on" type="uint8_t" visibility="0x02" properties="0x00"/>
+   <attribute name="v_out" type="float" visibility="0x02" properties="0x00"/>
+   <attribute name="i_out" type="float" visibility="0x02" properties="0x00"/>
+   <attribute name="t_out" type="float" visibility="0x02" properties="0x00"/>
+  </class>
+  <class name="NextionPsuEvt" superclass="qpc::QEvt">
+   <attribute name="super" type="QEvt" visibility="0x02" properties="0x00"/>
+   <attribute name="present" type="uint8_t" visibility="0x02" properties="0x00"/>
+   <attribute name="output_on" type="uint8_t" visibility="0x02" properties="0x00"/>
+   <attribute name="v_out" type="float" visibility="0x02" properties="0x00"/>
+   <attribute name="i_out" type="float" visibility="0x02" properties="0x00"/>
+   <attribute name="temp_C" type="float" visibility="0x02" properties="0x00"/>
+  </class>
+  <class name="NextionPageEvt" superclass="qpc::QEvt">
+   <documentation>NextionPageEvt → NEX_REQ_SHOW_PAGE_SIG</documentation>
+   <attribute name="super" type="QEvt" visibility="0x02" properties="0x00"/>
+   <attribute name="page" type="uint8_t" visibility="0x02" properties="0x00"/>
+  </class>
+  <class name="NextionSummaryEvt" superclass="qpc::QEvt">
+   <documentation>NextionSummaryEvt → NEX_REQ_UPDATE_SUMMARY_SIG</documentation>
+   <attribute name="super" type="QEvt" visibility="0x02" properties="0x00"/>
+   <attribute name="classStr[12]" type="char" visibility="0x02" properties="0x00"/>
+   <attribute name="classColor565" type="uint16_t" visibility="0x02" properties="0x00"/>
+   <attribute name="battTypeStr[12]" type="char" visibility="0x02" properties="0x00"/>
+   <attribute name="typeColor565" type="uint16_t" visibility="0x02" properties="0x00"/>
+   <attribute name="battery_type_code" type="uint16_t" visibility="0x02" properties="0x00"/>
+   <attribute name="packV" type="float" visibility="0x02" properties="0x00"/>
+   <attribute name="statusStr[24]" type="char" visibility="0x02" properties="0x00"/>
+   <attribute name="statusColor565" type="uint16_t" visibility="0x02" properties="0x00"/>
+   <attribute name="errors[48]" type="char" visibility="0x02" properties="0x00"/>
+   <attribute name="warnIcon" type="uint8_t" visibility="0x02" properties="0x00"/>
+   <attribute name="recoverable" type="uint8_t" visibility="0x02" properties="0x00"/>
+   <attribute name="charging" type="uint8_t" visibility="0x02" properties="0x00"/>
+   <attribute name="psu_present" type="uint8_t" visibility="0x02" properties="0x00"/>
+   <attribute name="psu_out_on" type="uint8_t" visibility="0x02" properties="0x00"/>
+   <attribute name="psu_v" type="float" visibility="0x02" properties="0x00"/>
+   <attribute name="psu_i" type="float" visibility="0x02" properties="0x00"/>
+   <attribute name="psu_t" type="float" visibility="0x02" properties="0x00"/>
+   <attribute name="reason[96]" type="char" visibility="0x02" properties="0x00"/>
+  </class>
+  <class name="NextionDetailsEvt" superclass="qpc::QEvt">
+   <documentation>NextionDetailsEvt → NEX_REQ_UPDATE_DETAILS_SIG</documentation>
+   <attribute name="super" type="QEvt" visibility="0x02" properties="0x00"/>
+   <attribute name="high_voltage_V" type="float" visibility="0x02" properties="0x00"/>
+   <attribute name="low_voltage_V" type="float" visibility="0x02" properties="0x00"/>
+   <attribute name="avg_voltage_V" type="float" visibility="0x02" properties="0x00"/>
+   <attribute name="high_temp_C" type="float" visibility="0x02" properties="0x00"/>
+   <attribute name="low_temp_C" type="float" visibility="0x02" properties="0x00"/>
+   <attribute name="pack_high_temp_C" type="float" visibility="0x02" properties="0x00"/>
+   <attribute name="pack_low_temp_C" type="float" visibility="0x02" properties="0x00"/>
+   <attribute name="serial_number[24]" type="char" visibility="0x02" properties="0x00"/>
+   <attribute name="firmware[16]" type="char" visibility="0x02" properties="0x00"/>
+   <attribute name="fan_speed_rpm" type="uint16_t" visibility="0x02" properties="0x00"/>
+   <attribute name="soc_percent" type="uint8_t" visibility="0x02" properties="0x00"/>
+   <attribute name="soc2_percent" type="uint8_t" visibility="0x02" properties="0x00"/>
+   <attribute name="bms_state_str[24]" type="char" visibility="0x02" properties="0x00"/>
+   <attribute name="bms_fault_str[48]" type="char" visibility="0x02" properties="0x00"/>
+  </class>
+  <class name="NextionLiveEvt" superclass="qpc::QEvt">
+   <documentation>NextionLiveEvt → NEX_REQ_UPDATE_PSU_SIG</documentation>
+   <attribute name="super" type="QEvt" visibility="0x02" properties="0x00"/>
+   <attribute name="packV" type="float" visibility="0x02" properties="0x00"/>
+   <attribute name="packA" type="float" visibility="0x02" properties="0x00"/>
+   <attribute name="soc" type="uint8_t" visibility="0x02" properties="0x00"/>
+   <attribute name="tempC" type="uint16_t" visibility="0x02" properties="0x00"/>
+   <attribute name="bms_present" type="uint8_t" visibility="0x02" properties="0x00"/>
+   <attribute name="vMinCell" type="float" visibility="0x02" properties="0x00"/>
+   <attribute name="vMaxCell" type="float" visibility="0x02" properties="0x00"/>
+   <attribute name="vDeltaCell" type="float" visibility="0x02" properties="0x00"/>
+   <attribute name="tMinC" type="uint16_t" visibility="0x02" properties="0x00"/>
+   <attribute name="tMaxC" type="uint16_t" visibility="0x02" properties="0x00"/>
+   <attribute name="cycles" type="uint16_t" visibility="0x02" properties="0x00"/>
+   <attribute name="faultsMask" type="uint32_t" visibility="0x02" properties="0x00"/>
+   <attribute name="cotek_present" type="uint8_t" visibility="0x02" properties="0x00"/>
+   <attribute name="cotek_out_on" type="uint8_t" visibility="0x02" properties="0x00"/>
+   <attribute name="cotek_V" type="float" visibility="0x02" properties="0x00"/>
+   <attribute name="cotek_I" type="float" visibility="0x02" properties="0x00"/>
+   <attribute name="cotek_T" type="int16_t" visibility="0x02" properties="0x00"/>
+  </class>
+ </package>
+ <package name="System" stereotype="0x03">
+  <class name="SystemFlowView">
+   <documentation>System Flow (text view) — Cotek/BMS/Nextion/Controller
+
+Actors (Active Objects)
+  [Bms]        — priority 3 — polls CAN, publishes telemetry
+  [Controller] — priority 4 — orchestrates UI/PSU/charge window
+  [Cotek]      — priority 2 — I²C PSU driver + status polling
+  [Nextion]    — priority 5 — HMI writer
+
+External
+  [CAN ISR]    — publishes CAN_RX_SIG (Bms subscribed)
+  [BTN ISR]    — posts BUTTON_PRESSED_SIG to Controller
+
+Message Paths
+  Bms  ──▶ Controller : BMS_UPDATED_SIG, BMS_NO_BATTERY_SIG, BMS_CONN_LOST_SIG
+  Ctrl ──▶ Nextion    : NEX_REQ_SHOW_PAGE_SIG, NEX_REQ_UPDATE_SUMMARY_SIG,
+                        NEX_REQ_UPDATE_DETAILS_SIG, NEX_REQ_UPDATE_PSU_SIG
+  Next ──▶ Ctrl       : NEX_READY_SIG
+  Ctrl ──▶ Cotek      : PSU_REQ_SETPOINT_SIG, PSU_REQ_OFF_SIG
+  Cotek──▶ Ctrl       : PSU_RSP_STATUS_SIG, COTEK_STATUS_SIG
+
+Text “Diagram” (monospace)
+
+     [CAN ISR]                                             [BTN ISR]
+         │                                                     │
+         │ publish CAN_RX_SIG                                  │ BUTTON_PRESSED_SIG
+         ▼                                                     ▼
+       +------+         BMS_* signals            +-----------------------+
+       | Bms  | ───────────────────────────────▶ |      Controller       |
+       +------+                                  |  run:{wait,detect,    |
+         ▲                                       |      charge,powerDown} |
+         │                                       +-----------------------+
+         │                                                │        ▲
+         │                                                │        │ PSU_RSP_STATUS_SIG /
+         │                                                │        │ COTEK_STATUS_SIG
+         │                                                ▼        │
+         │                                        +--------------------+
+         │   NEX_REQ_* signals                    |      Cotek         |
+         └──────────────────────────────────────▶ |  (PSU driver)      |
+                                                  +--------------------+
+                         ▲
+                         │ NEX_READY_SIG
+                 +----------------+
+                 |    Nextion     |
+                 |     (HMI)      |
+                 +----------------+
+
+Key Timers (owned by Controller)
+  ui2s       → TIMEOUT_SIG          (UI refresh ~2s)
+  tCharge    → CHARGE_TIMEOUT_SIG   (charge window 30s)
+  tPsuOff    → PSU_OFF_WAIT_TO_SIG  (power-down guard ~200–500ms)
+
+Notes
+  • Bms publishes BMS_* at ~2 Hz; declares CONN_LOST when no frames ~2 s.
+  • Cotek polls PSU ~200–500 ms and reports deltas via COTEK_STATUS_SIG.
+  • Controller opens a 30 s charge window, cancels on BTN or BMS lost.</documentation>
+  </class>
+ </package>
+ <package name="Main" stereotype="0x00"/>
+</model>
