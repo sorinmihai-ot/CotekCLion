@@ -91,6 +91,7 @@ add_executable(CotekCLion.elf ${APP_SOURCES} ${STARTUP_FILE}
         Core/Src/bsut.c
         Core/Src/bms_fault_decode.c
         Core/Inc/bms_debug.h
+        Core/Src/bms_sim.c
 )
 
 # --- Include paths ---
@@ -109,7 +110,7 @@ target_compile_definitions(CotekCLion.elf PRIVATE
         USE_HAL_DRIVER
         STM32F103xB
         QF_BASEPRI=0x50  # 0x50 >> (8-4) = 5
-        #ENABLE_BMS_SIM
+        ENABLE_BMS_SIM
         $<$<CONFIG:Debug>:DEBUG>
 )
 

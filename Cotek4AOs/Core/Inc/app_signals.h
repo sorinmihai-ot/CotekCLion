@@ -30,6 +30,9 @@ enum AppSignals {
 #ifdef ENABLE_BMS_SIM
     SIM_TICK_SIG,          /* private periodic tick for the in-firmware BMS simulator */
 #endif
+    STARTBUTTON_PRESSED_SIG,
+    STOPBUTTON_PRESSED_SIG,
+
     MAX_PUB_SIG,               // sentinel for QF_psInit only
     /* HMI <-> Controller (direct posts) */
     BOOT_SIG = MAX_PUB_SIG + 1,

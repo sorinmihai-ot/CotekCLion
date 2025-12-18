@@ -52,7 +52,7 @@
 #include "stm32f1xx_hal_i2c.h"
 
 //Firmware Version
-const char FW_VERSION_STR[] = "0.4.2";
+const char FW_VERSION_STR[] = "0.5.0";
 static uint8_t nexRx[128];
 /* HMI RX buffer (visible to main and callbacks) */
 uint8_t s_uart3_rxbuf[128];
@@ -200,10 +200,11 @@ int main(void)
 
   //HAL_UARTEx_ReceiveToIdle_IT(&huart2, RxBuffer, 256);
   //Scan_I2C_Bus(&hi2c1);
+  QF_init();
     /* ---------------- dynamic event pools & pub/sub table --------------------*/
   static QF_MPOOL_EL(CanFrameEvt)     s_canPoolSto[64];
   static QF_MPOOL_EL(BmsTelemetryEvt) s_bmsPoolSto[32];
-  static QSubscrList subscrSto[MAX_PUB_SIG];
+  static QSubscrList subscrSto[MAX_PUB_SIG + 1U];
   QF_psInit(subscrSto, Q_DIM(subscrSto));
     /* pools: smallest blocks first */
     /* initialize pools in ascending size */
@@ -348,6 +349,44 @@ static void MX_GPIO_Init(void)
     HAL_GPIO_Init(USER_BTN_GPIO_Port, &GPIO_InitStruct);
     HAL_NVIC_SetPriority(EXTI15_10_IRQn, QF_AWARE_ISR_CMSIS_PRI+1, 0);
     HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+
+  /* ---- Relay module outputs (active-low): PB13, PB14, PB15 ---- */
+  GPIO_InitStruct.Pin   = GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5;
+  GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull  = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* Default OFF for active-low relays => drive HIGH */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5, GPIO_PIN_SET);
+
+  /* ---- Start/Stop buttons: PC0, PC1 ----
+     Using pull-up so:
+       - Start pressed = reads HIGH (you said "voltage on PC0")
+       - Stop pressed  = reads LOW if wired to GND (your stop wiring description)
+  */
+  /* ---- Start button: PC0 (active-high when pressed) ---- */
+  GPIO_InitStruct.Pin  = GPIO_PIN_0;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;     // IMPORTANT: define idle low
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /* ---- Stop button: PC1 (active-low when pressed to GND) ---- */
+  GPIO_InitStruct.Pin  = GPIO_PIN_1;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;       // define idle high
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /* ---- Interlock detect: PB12 ---- */
+  GPIO_InitStruct.Pin  = GPIO_PIN_12;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;   // change to PULLUP/PULLDOWN if your wiring needs it
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* ---- Thermistors: PA0, PA1 (ADC inputs) ---- */
+  GPIO_InitStruct.Pin  = GPIO_PIN_0 | GPIO_PIN_1;
+  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
 }
 /**

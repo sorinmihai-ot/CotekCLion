@@ -23,6 +23,22 @@ void BSP_ledOn(void);
 void BSP_ledOff(void);
 void BSP_delay(uint32_t ms);
 
+// Returns true if the dedicated 600s sense pin is high (600s connected),
+// false if low (BMZ or nothing).
+bool BSP_is600s_gpio_high(void);
+
+// ---- Buttons ----
+bool BSP_isStartPressed(void);   // PC0
+bool BSP_isStopPressed(void);    // PC1
+
+// ---- Relays (active-low) ----
+void BSP_relay2_set(bool on);    // PB3
+void BSP_relay3_set(bool on);    // PB4
+void BSP_relay4_set(bool on);    // PB5
+
+// ---- Interlock ----
+bool BSP_isInterlockOK(void);    // PB12
+
 /* Active objects... */
 extern QActive *AO_Cotek;
 

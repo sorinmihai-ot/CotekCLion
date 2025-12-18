@@ -43,6 +43,14 @@ bool BSP_qfStarted(void) {
     return s_qf_started != 0U;
 }
 
+bool BSP_is600s_gpio_high(void) {
+    // Example: PC5 with external 5V via 600s connector and MCU pulldown.
+    // Change this to match your real pin.
+    //return (GPIOC->IDR & (1U << 5)) != 0U;
+    // If you use HAL:
+    return (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_4) == GPIO_PIN_SET);
+}
+
 void BSP_markQfStarted(void) {
     s_qf_started = true;
 }
@@ -133,6 +141,31 @@ void BSP_die(uint8_t code) {
         HAL_Delay(600);
     }
 }
+
+//--------StartButton-----------------
+bool BSP_isStartPressed(void) {
+    return HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_0) == GPIO_PIN_SET;
+}
+
+//--------StopButton------------------
+bool BSP_isStopPressed(void) {
+    return HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_1) == GPIO_PIN_RESET; // grounded
+}
+
+// active-low relays
+static inline void relay_write(GPIO_TypeDef *port, uint16_t pin, bool on) {
+    HAL_GPIO_WritePin(port, pin, on ? GPIO_PIN_RESET : GPIO_PIN_SET);
+}
+
+void BSP_relay2_set(bool on) { relay_write(GPIOB, GPIO_PIN_3, on); }
+void BSP_relay3_set(bool on) { relay_write(GPIOB, GPIO_PIN_4, on); }
+void BSP_relay4_set(bool on) { relay_write(GPIOB, GPIO_PIN_5, on); }
+
+bool BSP_isInterlockOK(void) {
+    return HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_12) == GPIO_PIN_SET;
+}
+
+
 static volatile uint8_t s_aos_ready = 0U;
 void BSP_markAOsReady(void) { s_aos_ready = 1U; }
 
@@ -230,48 +263,122 @@ void assert_failed(char const * const module, int_t const id) {
 
 
 // ISRs  ======================================================================
-void SysTick_Handler(void) {
-    /* HAL tick must always run */
+void SysTick_Handler(void) { /* HAL tick must always run */
     HAL_IncTick();
-
     if (s_qf_started) {
         /* QP time events */
         static uint8_t q_tick_div;
-        if (++q_tick_div >= 10) {   // 1000 Hz / 10 = 100 Hz
+        if (++q_tick_div >= 10) {
+            // 1000 Hz / 10 = 100 Hz
             q_tick_div = 0;
             QTIMEEVT_TICK_X(0U, &l_SysTick_Handler);
-            }
-
+        }
         /* Button debounce + posts ONLY after kernel started */
         static struct {
             uint32_t depressed;
             uint32_t previous;
         } buttons = { 0U, 0U };
-
         uint32_t current = GPIOC->IDR;
         uint32_t tmp = buttons.depressed;
         buttons.depressed |= (buttons.previous & current);
         buttons.depressed &= (buttons.previous | current);
-        buttons.previous   = current;
+        buttons.previous = current;
         tmp ^= buttons.depressed;
         current = buttons.depressed;
-        static uint32_t warmup = 200U; // ~200 ms at 1 kHz
+        static uint32_t warmup = 200U;
+        // ~200 ms at 1 kHz
         if (warmup) { --warmup; return; }
+
+        /* =========================================================
+         * Start/Stop debounce (PC0/PC1), then edge-detect on debounced
+         * ========================================================= */
+        enum { SS_DEB_MS = 10U };       /* tune: 5..20ms typical */
+        static uint8_t start_cnt = 0U;
+        static uint8_t stop_cnt  = 0U;
+        static uint8_t start_db  = 0U; /* debounced level: 1=pressed */
+        static uint8_t stop_db   = 0U; /* debounced level: 1=pressed */
+        static uint8_t prev_start_db = 0U;
+        static uint8_t prev_stop_db  = 0U;
+
+        /* Raw levels */
+        uint8_t raw_start = (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_0) == GPIO_PIN_SET)   ? 1U : 0U; /* active HIGH */
+        uint8_t raw_stop  = (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_1) == GPIO_PIN_RESET) ? 1U : 0U; /* active LOW  */
+
+        /* Debounce START: require SS_DEB_MS consecutive samples */
+        if (raw_start == start_db) {
+            start_cnt = 0U; /* stable at current debounced level */
+        } else {
+            if (start_cnt < SS_DEB_MS) {
+                ++start_cnt;
+                if (start_cnt >= SS_DEB_MS) {
+                    start_db = raw_start;
+                    start_cnt = 0U;
+                }
+            }
+        }
+
+        /* Debounce STOP */
+        if (raw_stop == stop_db) {
+            stop_cnt = 0U;
+        } else {
+            if (stop_cnt < SS_DEB_MS) {
+                ++stop_cnt;
+                if (stop_cnt >= SS_DEB_MS) {
+                    stop_db = raw_stop;
+                    stop_cnt = 0U;
+                }
+            }
+        }
+
+        /* Rising edge on debounced press */
+        if ((start_db != 0U) && (prev_start_db == 0U)) {
+            static QEvt const ev = QEVT_INITIALIZER(STARTBUTTON_PRESSED_SIG);
+            g_lastSig = STARTBUTTON_PRESSED_SIG; g_lastTag = 31;
+            QF_PUBLISH(&ev, 0U);
+        }
+
+        if ((stop_db != 0U) && (prev_stop_db == 0U)) {
+            static QEvt const ev = QEVT_INITIALIZER(STOPBUTTON_PRESSED_SIG);
+            g_lastSig = STOPBUTTON_PRESSED_SIG; g_lastTag = 32;
+            QF_PUBLISH(&ev, 0U);
+        }
+
+        prev_start_db = start_db;
+        prev_stop_db  = stop_db;
         if ((tmp & (1U << B1_PIN)) != 0U) {
             if ((current & (1U << B1_PIN)) != 0U) {
                 static QEvt const pressEvt = QEVT_INITIALIZER(BUTTON_PRESSED_SIG);
-                g_lastSig = BUTTON_PRESSED_SIG;  g_lastTag = 1;  // tag 1 = SysTick press
+                g_lastSig = BUTTON_PRESSED_SIG;
+                g_lastTag = 1;
+                // tag 1 = SysTick press
+                QACTIVE_POST_X(AO_Controller, &pressEvt, 3U, 0U);
+                printf("BTN: PC13 pressed\r\n"); }
+            else { static QEvt const releaseEvt = QEVT_INITIALIZER(BUTTON_RELEASED_SIG);
+                g_lastSig = BUTTON_RELEASED_SIG;
+                g_lastTag = 2;
+                // tag 2 = SysTick release
+                QACTIVE_POST_X(AO_Controller, &releaseEvt, 3U, 0U);
+            }
+        }
+        /* =========================================================
+         * Existing PC13 debounced edge detect (unchanged)
+         * ========================================================= */
+        if ((tmp & (1U << B1_PIN)) != 0U) {
+            if ((current & (1U << B1_PIN)) != 0U) {
+                static QEvt const pressEvt = QEVT_INITIALIZER(BUTTON_PRESSED_SIG);
+                g_lastSig = BUTTON_PRESSED_SIG;
+                g_lastTag = 1;
                 QACTIVE_POST_X(AO_Controller, &pressEvt, 3U, 0U);
                 printf("BTN: PC13 pressed\r\n");
             } else {
                 static QEvt const releaseEvt = QEVT_INITIALIZER(BUTTON_RELEASED_SIG);
-                g_lastSig = BUTTON_RELEASED_SIG; g_lastTag = 2; // tag 2 = SysTick release
+                g_lastSig = BUTTON_RELEASED_SIG;
+                g_lastTag = 2;
                 QACTIVE_POST_X(AO_Controller, &releaseEvt, 3U, 0U);
             }
         }
     }
 }
-
 //............................................................................
 void QV_onIdle(void) {
     QF_INT_ENABLE();

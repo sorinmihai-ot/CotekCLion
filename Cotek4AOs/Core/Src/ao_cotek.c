@@ -20,6 +20,14 @@ Q_DEFINE_THIS_FILE
 
 #define COTEK_I2C_ADDR ((0x50) << 1)  // STM32 expects 8-bit address (shifted left)
 #define I2C_TIMEOUT_MS 100
+
+// We already use COTEK_TICK_SIG. Keep its period at 500ms (50 ticks @ 10ms tick).
+#define COTEK_TICK_ARM_FIRST   50U
+#define COTEK_TICK_ARM_PERIOD  50U
+
+// ~3 seconds using 500ms ticks => 6 periods
+#define COTEK_BOOT_TICKS_3S    6U
+
 static uint8_t tx_data[2];
 static uint8_t rx_data[2];
 extern volatile uint16_t g_lastSig;
@@ -36,7 +44,9 @@ static void  cotek_power_off(void);
 static float cotek_read_voltage(void);
 static float cotek_read_current(void);
 static float cotek_read_temperature(void);
-
+static uint8_t cotek_read_control(uint8_t *ctrl);
+static uint8_t i2c_read_u16(uint8_t reg, uint16_t *out);
+static uint8_t i2c_read_u8(uint8_t reg, uint8_t *out);
 
 typedef struct {
     QActive super;
@@ -52,7 +62,21 @@ typedef struct {
     /* --- startup policy --- */
     uint8_t startup_sync;   /* 1 = we are confirming OFF at boot */
     uint8_t off_acks;       /* consecutive reads showing output OFF */
+    // --- NEW: boot gating / buffering ---
+    uint8_t boot_ticks_left;     // used in Cotek_UP
+    uint8_t pending_setpoint;    // 1 if we received PSU_REQ_SETPOINT while not ready
+    float   pend_vset, pend_iset;
 } CotekAO;
+
+static CotekAO l_psu;
+QActive *AO_Cotek = &l_psu.super;
+
+/* ===== Forward declarations of states ===== */
+static QState Cotek_qp_initial (CotekAO *me, void const *par);
+static QState Cotek_off        (CotekAO *me, QEvt const *e);
+static QState Cotek_up         (CotekAO *me, QEvt const *e);
+static QState Cotek_initial(CotekAO *me, QEvt const *e);
+static QState Cotek_active (CotekAO *me, QEvt const *e);
 
 static void publish_status(CotekAO *me) {
     CotekStatusEvt *se = Q_NEW(CotekStatusEvt, PSU_RSP_STATUS_SIG);
@@ -83,15 +107,24 @@ static void post_psu(const CotekAO *me,
     }
 }
 
+/* small helper so OFF state can “announce” PSU is gone */
+static void psu_mark_offline(CotekAO *me, char const *why) {
+    me->present = 0U;
+    me->out_on  = 0U;
+    me->v_out   = 0.0f;
+    me->i_out   = 0.0f;
+    me->t_out   = 0.0f;
+    me->alive_ms = 5000U;
 
-static QState Cotek_initial(CotekAO *me, void const *par);
-static QState Cotek_active (CotekAO *me, QEvt const *e);
-
-static CotekAO l_psu;
-QActive *AO_Cotek = &l_psu.super;
+    if (why) {
+        printf("COTEK: %s\r\n", why);
+    }
+    post_psu(me, 0U, 0U, 0.0f, 0.0f, NAN);
+    publish_status(me);
+}
 
 void CotekAO_ctor(void) {
-    QActive_ctor(&l_psu.super, Q_STATE_CAST(&Cotek_initial));
+    QActive_ctor(&l_psu.super, Q_STATE_CAST(&Cotek_qp_initial));
 }
 static uint8_t cotek_read_control(uint8_t *ctrl) {
     uint8_t reg = 0x7C;
@@ -126,114 +159,415 @@ static uint8_t i2c_read_u8(uint8_t reg, uint8_t *out) {
     return 1U;
 }
 
-static QState Cotek_initial(CotekAO * const me, void const *par) {
+/* ===== QP initial pseudo-state ===== */
+static QState Cotek_qp_initial(CotekAO * const me, void const *par) {
     (void)par;
-    cotek_set_remote_mode();
-    cotek_power_off();
-    me->on = 0U; me->vset = 0.f; me->iset = 0.f;
-    QTimeEvt_ctorX(&me->tick, &me->super, COTEK_TICK_SIG, 0U);
-    // start periodic every 500ms
-    QTimeEvt_armX(&me->tick, 50U, 50U); // assuming 1 tick = 10 ms (adjust to your BSP tick)
-    me->alive_ms = 1000U;   // start as stale
+
+    me->on = 0U;
+    me->vset = 0.f;
+    me->iset = 0.f;
+
+    me->alive_ms = 5000U;
     me->present = 0U;
     me->out_on  = 0U;
     me->v_out = me->i_out = me->t_out = 0.0f;
-    /* start in "startup sync": confirm real OFF before we publish “OFF” */
-    me->startup_sync = 1U;
-    me->off_acks     = 0U;
-    return Q_TRAN(&Cotek_active);
+
+    me->startup_sync = 0U;
+    me->off_acks = 0U;
+
+    me->boot_ticks_left = 0U;
+    me->pending_setpoint = 0U;
+    me->pend_vset = 0.0f;
+    me->pend_iset = 0.0f;
+
+    QTimeEvt_ctorX(&me->tick, &me->super, COTEK_TICK_SIG, 0U);
+
+    /* Cotek AO needs to see Start/Stop too (posted or published) */
+    QActive_subscribe(&me->super, STARTBUTTON_PRESSED_SIG);
+    QActive_subscribe(&me->super, STOPBUTTON_PRESSED_SIG);
+
+    return Q_TRAN(&Cotek_off);
 }
 
-static QState Cotek_active(CotekAO * const me, QEvt const * const e)
-{
-    switch (e->sig)
-    {
-            case COTEK_TICK_SIG: {
-                uint16_t rawV = 0, rawI = 0;   uint8_t rawT = 0, ctrl = 0;
-                uint8_t okV = i2c_read_u16(0x60, &rawV);          // V*100
-                uint8_t okI = i2c_read_u16(0x62, &rawI);          // A*100
-                uint8_t okT = i2c_read_u8 (0x68, &rawT);          // °C
-                uint8_t okC = cotek_read_control(&ctrl);          // bit0=ON
+/* ===== COTEK_OFF: AC is OFF, do not touch I2C ===== */
+static QState Cotek_off(CotekAO * const me, QEvt const * const e) {
+    switch (e->sig) {
+        case Q_ENTRY_SIG: {
+            /* stop any periodic activity */
+            QTimeEvt_disarm(&me->tick);
 
-                uint8_t okAny = (okV || okI || okT || okC);
-                if (okAny) {
-                    me->alive_ms = 0U;
-                    if (okV) me->v_out = (float)rawV / 100.0f;
-                    if (okI) me->i_out = (float)rawI / 100.0f;
-                    if (okT) me->t_out = (float)rawT;
-                    if (okC) me->out_on = ((ctrl & 0x01U) != 0U);  // bit0 = output enable
-                } else {
-                    if (me->alive_ms < 5000U) { me->alive_ms += 200U; } // 200 ms tick
-                }
-                uint8_t new_present = (me->alive_ms <= 1000U) ? 1U : 0U;
-                me->present = new_present;
+            /* clear logical state */
+            me->on = 0U;
+            me->vset = 0.f;
+            me->iset = 0.f;
 
-                static uint8_t last_present = 0xFFU, last_out_on = 0xFFU;
-                static float   last_v = -999.0f, last_i = -999.0f, last_t = -999.0f;
+            /* clear “pending setpoint” */
+            me->pending_setpoint = 0U;
 
-                if (   (new_present != last_present)
-                    || (me->out_on   != last_out_on)
-                    || (fabsf(last_v - me->v_out) > 0.05f)
-                    || (fabsf(last_i - me->i_out) > 0.05f)
-                    || (fabsf(last_t - me->t_out) > 0.5f)) {
+            psu_mark_offline(me, "state=OFF (AC disabled)");
+            return Q_HANDLED();
+        }
 
-                    last_present = new_present;
-                    last_out_on  = me->out_on;
-                    last_v       = me->v_out;
-                    last_i       = me->i_out;
-                    last_t       = me->t_out;
+        case STARTBUTTON_PRESSED_SIG: {
+            /* AC will be enabled externally by your wiring */
+            printf("COTEK: Start pressed -> state=UP (boot wait)\r\n");
+            return Q_TRAN(&Cotek_up);
+        }
 
-                    post_psu(me, new_present, me->out_on, me->v_out, me->i_out, me->t_out);
-                    publish_status(me);
+        case STOPBUTTON_PRESSED_SIG: {
+            /* already off */
+            return Q_HANDLED();
+        }
+
+        case PSU_REQ_SETPOINT_SIG: {
+            /* Controller might send setpoint immediately; buffer it */
+            PsuSetEvt const *se = Q_EVT_CAST(PsuSetEvt);
+            me->pending_setpoint = 1U;
+            me->pend_vset = se->voltSet;
+            me->pend_iset = se->currSet;
+            printf("COTEK: buffered setpoint V=%.2f I=%.2f (PSU OFF)\r\n",
+                   (double)me->pend_vset, (double)me->pend_iset);
+            return Q_HANDLED();
+        }
+
+        case PSU_REQ_OFF_SIG: {
+            /* nothing to do (no AC / no I2C) */
+            return Q_HANDLED();
+        }
+
+        default: break;
     }
-                    return Q_HANDLED();
+    return Q_SUPER(&QHsm_top);
+}
+
+/* ===== COTEK_UP: wait ~3s for Cotek to boot after AC enabled ===== */
+static QState Cotek_up(CotekAO * const me, QEvt const * const e) {
+    switch (e->sig) {
+        case Q_ENTRY_SIG: {
+            /* 3s boot timer using the 500ms tick */
+            me->boot_ticks_left = COTEK_BOOT_TICKS_3S;
+
+            /* ensure we publish “not present yet” during boot */
+            psu_mark_offline(me, "state=UP (waiting for Cotek boot)");
+
+            /* start tick for countdown */
+            QTimeEvt_armX(&me->tick, COTEK_TICK_ARM_FIRST, COTEK_TICK_ARM_PERIOD);
+            return Q_HANDLED();
+        }
+
+        case STOPBUTTON_PRESSED_SIG: {
+            printf("COTEK: Stop pressed -> state=OFF\r\n");
+            return Q_TRAN(&Cotek_off);
+        }
+
+        case STARTBUTTON_PRESSED_SIG: {
+            /* ignore repeats */
+            return Q_HANDLED();
+        }
+
+        case PSU_REQ_SETPOINT_SIG: {
+            /* buffer while booting */
+            PsuSetEvt const *se = Q_EVT_CAST(PsuSetEvt);
+            me->pending_setpoint = 1U;
+            me->pend_vset = se->voltSet;
+            me->pend_iset = se->currSet;
+            printf("COTEK: buffered setpoint V=%.2f I=%.2f (booting)\r\n",
+                   (double)me->pend_vset, (double)me->pend_iset);
+            return Q_HANDLED();
+        }
+
+        case COTEK_TICK_SIG: {
+            if (me->boot_ticks_left > 0U) {
+                --me->boot_ticks_left;
             }
-            case PSU_REQ_SETPOINT_SIG: {
-                    // refuse if not present (prevents programming into a bus error)
-                    if (me->present == 0U) {
-                        printf("COTEK: IGNORE setpoint (PSU not present)\r\n");
-                        return Q_HANDLED();
-                    }
-                    PsuSetEvt const *se = Q_EVT_CAST(PsuSetEvt);
-                    me->vset = se->voltSet;
-                    me->iset = se->currSet;
-                    me->on = 1U;
-                    /* Program the supply over I2C */
-                    cotek_set_remote_mode();
-                    cotek_set_output_voltage(me->vset);
-                    cotek_set_output_current(me->iset);
-                    cotek_commit_settings();
-                    cotek_power_on();
-                    me->out_on = 1U;
-
-
-            printf("COTEK: ON V=%.2f I=%.2f\r\n", me->vset, me->iset);
-                    /* Push an immediate UI update so pMain shows PSU group “live” */
-                    post_psu(me,
-                             /*present=*/1U,
-                             /*output_on=*/me->out_on,
-                             /*v_out=*/me->vset,   /* show setpoints until readback arrives */
-                             /*i_out=*/0.0f,
-                             /*temp_C=*/NAN);
-
-                    printf("COTEK: ON V=%.2f I=%.2f\r\n", me->vset, me->iset);
-                    return Q_HANDLED();
+            if (me->boot_ticks_left == 0U) {
+                printf("COTEK: boot wait done -> state=Initial\r\n");
+                return Q_TRAN(&Cotek_initial);
             }
-            case PSU_REQ_OFF_SIG: {
-                    me->on = 0U;
-                    cotek_set_remote_mode();
-                    cotek_power_off();   /* actively command OFF */
-                    printf("COTEK: OFF\r\n");
-                    me->startup_sync = 1U;
-                    me->off_acks = 0U;
+            return Q_HANDLED();
+        }
 
-                    return Q_HANDLED();
+        default: break;
+    }
+    return Q_SUPER(&QHsm_top);
+}
+
+/* ===== COTEK_Initial: now it should be alive; configure + start polling ===== */
+static QState Cotek_initial(CotekAO * const me, QEvt const * const e) {
+    switch (e->sig) {
+        case Q_ENTRY_SIG: {
+            printf("COTEK: state=Initial (config + start polling)\r\n");
+
+            /* Now AC should be on: safe to touch I2C */
+            cotek_set_remote_mode();
+            cotek_power_off();
+
+            me->on = 0U;
+            me->vset = 0.f;
+            me->iset = 0.f;
+
+            /* presence starts as unknown until we get replies */
+            me->alive_ms = 5000U;
+            me->present = 0U;
+            me->out_on  = 0U;
+            me->v_out = me->i_out = me->t_out = 0.0f;
+
+            me->startup_sync = 1U;
+            me->off_acks     = 0U;
+
+            /* keep the same 500ms tick, but from now it will do I2C polling */
+            QTimeEvt_disarm(&me->tick);
+            QTimeEvt_armX(&me->tick, COTEK_TICK_ARM_FIRST, COTEK_TICK_ARM_PERIOD);
+
+            /* If controller already asked for a setpoint, apply immediately */
+            if (me->pending_setpoint) {
+                me->pending_setpoint = 0U;
+
+                me->vset = me->pend_vset;
+                me->iset = me->pend_iset;
+                me->on   = 1U;
+
+                printf("COTEK: applying buffered setpoint V=%.2f I=%.2f\r\n",
+                       (double)me->vset, (double)me->iset);
+
+                cotek_set_remote_mode();
+                cotek_set_output_voltage(me->vset);
+                cotek_set_output_current(me->iset);
+                cotek_commit_settings();
+                cotek_power_on();
+
+                /* optimistic UI until readback arrives */
+                me->out_on = 1U;
+                post_psu(me, /*present=*/1U, /*output_on=*/1U, me->vset, 0.0f, NAN);
+                publish_status(me);
             }
+
+            return Q_TRAN(&Cotek_active);
+        }
+
+        case STOPBUTTON_PRESSED_SIG: {
+            return Q_TRAN(&Cotek_off);
+        }
+
+        default: break;
+    }
+    return Q_SUPER(&QHsm_top);
+}
+
+/* ===== COTEK_Active: your existing behaviour + Stop->OFF ===== */
+static QState Cotek_active(CotekAO * const me, QEvt const * const e) {
+    switch (e->sig) {
+        case STOPBUTTON_PRESSED_SIG: {
+            /* Safety: request OFF then go to OFF (AC will drop externally) */
+            me->on = 0U;
+            cotek_set_remote_mode();
+            cotek_power_off();
+            printf("COTEK: Stop -> OFF\r\n");
+            return Q_TRAN(&Cotek_off);
+        }
+
+        case COTEK_TICK_SIG: {
+            uint16_t rawV = 0, rawI = 0;
+            uint8_t  rawT = 0, ctrl = 0;
+
+            uint8_t okV = i2c_read_u16(0x60, &rawV);          // V*100
+            uint8_t okI = i2c_read_u16(0x62, &rawI);          // A*100
+            uint8_t okT = i2c_read_u8 (0x68, &rawT);          // °C
+            uint8_t okC = cotek_read_control(&ctrl);          // bit0=ON
+
+            uint8_t okAny = (okV || okI || okT || okC);
+
+            if (okAny) {
+                me->alive_ms = 0U;
+                if (okV) me->v_out = (float)rawV / 100.0f;
+                if (okI) me->i_out = (float)rawI / 100.0f;
+                if (okT) me->t_out = (float)rawT;
+                if (okC) me->out_on = ((ctrl & 0x01U) != 0U);
+            } else {
+                if (me->alive_ms < 5000U) { me->alive_ms += 500U; } // 500ms tick now
+            }
+
+            uint8_t new_present = (me->alive_ms <= 1000U) ? 1U : 0U;
+            me->present = new_present;
+
+            static uint8_t last_present = 0xFFU, last_out_on = 0xFFU;
+            static float   last_v = -999.0f, last_i = -999.0f, last_t = -999.0f;
+
+            if (   (new_present != last_present)
+                || (me->out_on   != last_out_on)
+                || (fabsf(last_v - me->v_out) > 0.05f)
+                || (fabsf(last_i - me->i_out) > 0.05f)
+                || (fabsf(last_t - me->t_out) > 0.5f)) {
+
+                last_present = new_present;
+                last_out_on  = me->out_on;
+                last_v       = me->v_out;
+                last_i       = me->i_out;
+                last_t       = me->t_out;
+
+                post_psu(me, new_present, me->out_on, me->v_out, me->i_out, me->t_out);
+                publish_status(me);
+            }
+            return Q_HANDLED();
+        }
+
+        case PSU_REQ_SETPOINT_SIG: {
+            if (me->present == 0U) {
+                printf("COTEK: IGNORE setpoint (PSU not present)\r\n");
+                return Q_HANDLED();
+            }
+
+            PsuSetEvt const *se = Q_EVT_CAST(PsuSetEvt);
+            me->vset = se->voltSet;
+            me->iset = se->currSet;
+            me->on   = 1U;
+
+            cotek_set_remote_mode();
+            cotek_set_output_voltage(me->vset);
+            cotek_set_output_current(me->iset);
+            cotek_commit_settings();
+            cotek_power_on();
+            me->out_on = 1U;
+
+            printf("COTEK: ON V=%.2f I=%.2f\r\n", (double)me->vset, (double)me->iset);
+
+            post_psu(me,
+                     /*present=*/1U,
+                     /*output_on=*/1U,
+                     /*v_out=*/me->vset,
+                     /*i_out=*/0.0f,
+                     /*temp_C=*/NAN);
+            publish_status(me);
+            return Q_HANDLED();
+        }
+
+        case PSU_REQ_OFF_SIG: {
+            me->on = 0U;
+            cotek_set_remote_mode();
+            cotek_power_off();
+            printf("COTEK: OFF\r\n");
+
+            me->startup_sync = 1U;
+            me->off_acks = 0U;
+
+            /* Don’t force state OFF here; controller might want PSU comms alive but output off.
+               If you DO want AC removed on OFF request, then return Q_TRAN(&Cotek_off); */
+            return Q_HANDLED();
+        }
+
+        default: break;
     }
 
-        return Q_SUPER(&QHsm_top);
-    }
-
+    return Q_SUPER(&QHsm_top);
+}
+// static QState Cotek_initial(CotekAO * const me, void const *par) {
+//     (void)par;
+//     cotek_set_remote_mode();
+//     cotek_power_off();
+//     me->on = 0U; me->vset = 0.f; me->iset = 0.f;
+//     QTimeEvt_ctorX(&me->tick, &me->super, COTEK_TICK_SIG, 0U);
+//     // start periodic every 500ms
+//     QTimeEvt_armX(&me->tick, 50U, 50U); // assuming 1 tick = 10 ms (adjust to your BSP tick)
+//     me->alive_ms = 1000U;   // start as stale
+//     me->present = 0U;
+//     me->out_on  = 0U;
+//     me->v_out = me->i_out = me->t_out = 0.0f;
+//     /* start in "startup sync": confirm real OFF before we publish “OFF” */
+//     me->startup_sync = 1U;
+//     me->off_acks     = 0U;
+//     return Q_TRAN(&Cotek_active);
+// }
+//
+// static QState Cotek_active(CotekAO * const me, QEvt const * const e)
+// {
+//     switch (e->sig)
+//     {
+//             case COTEK_TICK_SIG: {
+//                 uint16_t rawV = 0, rawI = 0;   uint8_t rawT = 0, ctrl = 0;
+//                 uint8_t okV = i2c_read_u16(0x60, &rawV);          // V*100
+//                 uint8_t okI = i2c_read_u16(0x62, &rawI);          // A*100
+//                 uint8_t okT = i2c_read_u8 (0x68, &rawT);          // °C
+//                 uint8_t okC = cotek_read_control(&ctrl);          // bit0=ON
+//
+//                 uint8_t okAny = (okV || okI || okT || okC);
+//                 if (okAny) {
+//                     me->alive_ms = 0U;
+//                     if (okV) me->v_out = (float)rawV / 100.0f;
+//                     if (okI) me->i_out = (float)rawI / 100.0f;
+//                     if (okT) me->t_out = (float)rawT;
+//                     if (okC) me->out_on = ((ctrl & 0x01U) != 0U);  // bit0 = output enable
+//                 } else {
+//                     if (me->alive_ms < 5000U) { me->alive_ms += 200U; } // 200 ms tick
+//                 }
+//                 uint8_t new_present = (me->alive_ms <= 1000U) ? 1U : 0U;
+//                 me->present = new_present;
+//
+//                 static uint8_t last_present = 0xFFU, last_out_on = 0xFFU;
+//                 static float   last_v = -999.0f, last_i = -999.0f, last_t = -999.0f;
+//
+//                 if (   (new_present != last_present)
+//                     || (me->out_on   != last_out_on)
+//                     || (fabsf(last_v - me->v_out) > 0.05f)
+//                     || (fabsf(last_i - me->i_out) > 0.05f)
+//                     || (fabsf(last_t - me->t_out) > 0.5f)) {
+//
+//                     last_present = new_present;
+//                     last_out_on  = me->out_on;
+//                     last_v       = me->v_out;
+//                     last_i       = me->i_out;
+//                     last_t       = me->t_out;
+//
+//                     post_psu(me, new_present, me->out_on, me->v_out, me->i_out, me->t_out);
+//                     publish_status(me);
+//     }
+//                     return Q_HANDLED();
+//             }
+//             case PSU_REQ_SETPOINT_SIG: {
+//                     // refuse if not present (prevents programming into a bus error)
+//                     if (me->present == 0U) {
+//                         printf("COTEK: IGNORE setpoint (PSU not present)\r\n");
+//                         return Q_HANDLED();
+//                     }
+//                     PsuSetEvt const *se = Q_EVT_CAST(PsuSetEvt);
+//                     me->vset = se->voltSet;
+//                     me->iset = se->currSet;
+//                     me->on = 1U;
+//                     /* Program the supply over I2C */
+//                     cotek_set_remote_mode();
+//                     cotek_set_output_voltage(me->vset);
+//                     cotek_set_output_current(me->iset);
+//                     cotek_commit_settings();
+//                     cotek_power_on();
+//                     me->out_on = 1U;
+//
+//
+//             printf("COTEK: ON V=%.2f I=%.2f\r\n", me->vset, me->iset);
+//                     /* Push an immediate UI update so pMain shows PSU group “live” */
+//                     post_psu(me,
+//                              /*present=*/1U,
+//                              /*output_on=*/me->out_on,
+//                              /*v_out=*/me->vset,   /* show setpoints until readback arrives */
+//                              /*i_out=*/0.0f,
+//                              /*temp_C=*/NAN);
+//
+//                     printf("COTEK: ON V=%.2f I=%.2f\r\n", me->vset, me->iset);
+//                     return Q_HANDLED();
+//             }
+//             case PSU_REQ_OFF_SIG: {
+//                     me->on = 0U;
+//                     cotek_set_remote_mode();
+//                     cotek_power_off();   /* actively command OFF */
+//                     printf("COTEK: OFF\r\n");
+//                     me->startup_sync = 1U;
+//                     me->off_acks = 0U;
+//
+//                     return Q_HANDLED();
+//             }
+//     }
+//
+//         return Q_SUPER(&QHsm_top);
+//     }
+//
 
 void cotek_set_remote_mode(void) {
     // Write 0x80 to 0x7C (bit 7 = 1 ? Remote mode)

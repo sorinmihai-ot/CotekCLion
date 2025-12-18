@@ -35,6 +35,11 @@ void HAL_MspInit(void)
   */
   __HAL_AFIO_REMAP_SWJ_NOJTAG();
 
+  /* ===== USER HW GPIO init (Relays, Buttons, Interlock, Thermistors) ===== */
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+
 }
 /**
   * @brief CAN MSP Initialization
