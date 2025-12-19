@@ -350,7 +350,7 @@ static void MX_GPIO_Init(void)
     HAL_NVIC_SetPriority(EXTI15_10_IRQn, QF_AWARE_ISR_CMSIS_PRI+1, 0);
     HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
-  /* ---- Relay module outputs (active-low): PB13, PB14, PB15 ---- */
+  /* ---- Relay module outputs (active-low): PB3, PB4, PB5 ---- */
   GPIO_InitStruct.Pin   = GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5;
   GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull  = GPIO_NOPULL;

@@ -70,7 +70,42 @@ typedef struct {
     bool  warnIcon;
     bool  recoverable;
     char  reason[96];
+    uint8_t interlock_ok;   // 1 = Closed/OK, 0 = Open
 } NextionSummaryEvt;
+
+typedef struct {
+    QEvt super;
+
+    // page control
+    uint8_t show_page;       // 1 = force pCharging, 0 = don't force
+
+    // mode/status
+    uint8_t is_recovery;     // 1=recovery, 0=charging
+    char    bms_state[24];   // text shown in tBmsState
+    char    errors[96];      // text shown in tErrors (readable)
+
+    // timers (seconds)
+    uint16_t time_left_s;    // for tTimeLeft
+    uint16_t elapsed_s;      // for tPsuOnline
+
+    // Battery telemetry (strings or numbers)
+    float pack_v;            // tPackV
+    float h_v;               // tHVolt
+    float l_v;               // tLVolt
+    float a_v;               // tAVolt
+    float h_t;               // tHTemp
+    float l_t;               // tLTemp
+    float pack_h_t;          // tPackHTemp
+    float pack_l_t;          // tPackLTemp
+    uint8_t soc;             // tSoC
+
+    // PSU status
+    uint8_t psu_present;     // tPsu + color
+    uint8_t psu_out_on;      // tOutState + color
+    float   psu_v_out;       // tOutV
+    float   psu_i_out;       // tOutI
+    float   psu_temp;        // tPsuTemp
+} NextionChargeEvt;
 
 /* Nextion touch/button */
 typedef struct {

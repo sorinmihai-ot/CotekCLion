@@ -16,6 +16,7 @@ extern QActive * const AO_Controller;
 
 typedef struct {
     QActive super;
+    uint8_t cur_page;   // 0..4
 } NextionAO;
 
 static QState Nex_initial(NextionAO * const me, QEvt const * const e);
@@ -128,8 +129,10 @@ static QState Nex_active(NextionAO * const me, QEvt const * const e) {
                 nex_send3("ref pMain.pWarn");
                 break;
             case 3: nex_send3("page pDetails"); break;
+            case 4: nex_send3("page pCharging"); break;
             default: break;
         }
+        l_nex.cur_page = pe->page;
         return Q_HANDLED();
     }
     case NEX_REQ_UPDATE_SUMMARY_SIG: {
@@ -168,6 +171,12 @@ static QState Nex_active(NextionAO * const me, QEvt const * const e) {
         if (se->reason[0]) nex_send_textf("pMain.tRecReason.txt=\"%s\"", se->reason);
         else               nex_send_textf("pMain.tRecReason.txt=\"\"");
 #endif
+        // pMain interlock status
+        nex_send_textf("pMain.tInterStatus.txt=\"%s\"",
+                       se->interlock_ok ? "Closed" : "Open");
+        nex_sendf("pMain.tInterStatus.bco=%u",
+                  se->interlock_ok ? 2016U : 63488U);  // green : red
+        nex_send3("ref pMain.tInterStatus");
         return Q_HANDLED();
     }
 
@@ -207,6 +216,54 @@ static QState Nex_active(NextionAO * const me, QEvt const * const e) {
         nex_send_textf("pDetails.tBmsFault.txt=\"BMS_fault: %s\"", de->bms_fault_str);
         return Q_HANDLED();
     }
+
+    case NEX_REQ_UPDATE_CHARGE_SIG: {
+        NextionChargeEvt const *ce = Q_EVT_CAST(NextionChargeEvt);
+
+        if (ce->show_page && l_nex.cur_page != 4U) {
+            nex_send3("page pCharging");
+            l_nex.cur_page = 4U;
+        }
+
+        // tInfo
+        nex_send_textf("pCharging.tInfo.txt=\"%s\"",
+                       ce->is_recovery ? "Recovery in progress" : "Charging in progress");
+
+        // time left + elapsed
+        nex_send_textf("pCharging.tTimeLeft.txt=\"Time Left: %us\"", (unsigned)ce->time_left_s);
+        nex_send_textf("pCharging.tPsuOnline.txt=\"PSU Online: %us\"", (unsigned)ce->elapsed_s);
+
+        // PSU group + colors
+        nex_send_textf("pCharging.tPsu.txt=\"PSU: %s\"", ce->psu_present ? "Detected" : "Missing");
+        nex_sendf("pCharging.tPsu.bco=%u", ce->psu_present ? 2016U : 63488U);
+
+        nex_send_textf("pCharging.tOutState.txt=\"PSU Output: %s\"", ce->psu_out_on ? "ON" : "OFF");
+        nex_sendf("pCharging.tOutState.bco=%u", ce->psu_out_on ? 2016U : 63488U);
+
+        nex_send_textf("pCharging.tOutV.txt=\"PSU Vout: %.1f V\"", (double)ce->psu_v_out);
+        nex_send_textf("pCharging.tOutI.txt=\"PSU Iout: %.1f A\"", (double)ce->psu_i_out);
+        nex_send_textf("pCharging.tPsuTemp.txt=\"%.0f C\"", (double)ce->psu_temp);
+
+        // Battery telemetry
+        nex_send_textf("pCharging.tPackV.txt=\"%.2f V\"", (double)ce->pack_v);
+        nex_send_textf("pCharging.tHVolt.txt=\"%.2f\"", (double)ce->h_v);
+        nex_send_textf("pCharging.tLVolt.txt=\"%.2f\"", (double)ce->l_v);
+        nex_send_textf("pCharging.tAVolt.txt=\"%.2f\"", (double)ce->a_v);
+
+        nex_send_textf("pCharging.tHTemp.txt=\"%.1f\"", (double)ce->h_t);
+        nex_send_textf("pCharging.tLTemp.txt=\"%.1f\"", (double)ce->l_t);
+        nex_send_textf("pCharging.tPackHTemp.txt=\"%.1f\"", (double)ce->pack_h_t);
+        nex_send_textf("pCharging.tPackLTemp.txt=\"%.1f\"", (double)ce->pack_l_t);
+
+        nex_send_textf("pCharging.tSoC.txt=\"%u%%\"", (unsigned)ce->soc);
+        nex_send_textf("pCharging.tBmsState.txt=\"%s\"", ce->bms_state);
+
+        // Errors
+        if (ce->errors[0]) nex_send_textf("pCharging.tErrors.txt=\"%s\"", ce->errors);
+        else               nex_send3("pCharging.tErrors.txt=\"None\"");
+
+    return Q_HANDLED();
+}
 
     default: break;
     }

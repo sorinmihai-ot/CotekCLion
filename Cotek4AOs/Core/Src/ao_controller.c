@@ -13,6 +13,7 @@
 #include "batt_classify.h"
 #include "bms_fault_decode.h"
 #include "bms_debug.h"
+//#include "events.h"
 
 static uint32_t s_last_sum_ms;
 static uint32_t s_last_det_ms;
@@ -49,7 +50,14 @@ typedef struct {
 #endif
     ctl_state_t state;
     uint8_t psu_present, psu_out_on;
+    uint32_t charge_start_ms;
+    uint32_t charge_total_s;
     float   psu_v_out, psu_i_out, psu_temp;
+    QTimeEvt tChargeMon;          // fast monitor tick while charging
+    uint8_t  latch_prev;          // previous latch state (0/1)
+    uint8_t  stop_issued;         // prevent duplicate stop handling
+    ChargeStopReason last_stop_reason;
+    char     last_stop_text[48];
 } ControllerAO;
 
 /* ===== START/STOP buttons + Relay(2/3/4) helper block =====
@@ -378,6 +386,11 @@ static void make_summary(NextionSummaryEvt *se, const BmsTelemetry *t) {
     se->charging    = 0U;         // caller sets this if needed
     se->statusColor565 = 0U;      // leave 0 if you don’t tint the status label
     se->reason[0] = '\0';
+#if defined(ENABLE_BMS_SIM)
+    se->interlock_ok = 1U;   // SIM: treat as OK (or mirror a GPIO if you want)
+#else
+    se->interlock_ok = BSP_isInterlockOK() ? 1U : 0U;  // HIGH = Closed/OK
+#endif
 }
 
 static void make_details(NextionDetailsEvt *de, const BmsTelemetry *t) {
@@ -483,6 +496,63 @@ static void post_details_force(ControllerAO *me) {
         QF_gc(&de->super);
     }
 }
+static void post_charging_page(ControllerAO *me, uint8_t force_page) {
+    NextionChargeEvt *ce = Q_NEW(NextionChargeEvt, NEX_REQ_UPDATE_CHARGE_SIG);
+
+    // decide recovery vs charge (REAL only; SIM pick one)
+#if !defined(ENABLE_BMS_SIM)
+    BattClassResult cr = batt_classify(&me->last, /*bms_sim_active=*/false);
+    ce->is_recovery = (cr.cls == BATT_CLASS_RECOVERABLE) ? 1U : 0U;
+#else
+    ce->is_recovery = 0U;
+#endif
+
+    ce->show_page = force_page ? 1U : 0U;
+
+    // timers
+    uint32_t now = HAL_GetTick();
+    uint32_t elapsed_s = (now - me->charge_start_ms) / 1000U;
+    uint32_t left_s = (elapsed_s >= me->charge_total_s) ? 0U : (me->charge_total_s - elapsed_s);
+    ce->elapsed_s   = (uint16_t)elapsed_s;
+    ce->time_left_s = (uint16_t)left_s;
+
+    // battery telemetry (use what you already compute for details)
+    ce->pack_v   = me->last.array_voltage_V;
+    ce->h_v      = me->last.high_cell_V;
+    ce->l_v      = me->last.low_cell_V;
+    ce->a_v      = me->last.array_voltage_V; // you said avg uses array as coarse
+    ce->h_t      = me->last.sys_temp_high_C;
+    ce->l_t      = me->last.sys_temp_low_C;
+    ce->pack_h_t = me->last.sys_temp_high_C;
+    ce->pack_l_t = me->last.sys_temp_low_C;
+    ce->soc      = me->last.soc_percent;
+
+    // bms state text
+    strncpy(ce->bms_state,
+            BMS_state_to_text(me->last.battery_type_code, me->last.bms_state),
+            sizeof(ce->bms_state)-1);
+    ce->bms_state[sizeof(ce->bms_state)-1] = '\0';
+
+    // errors text (reuse your existing decoder)
+    {
+        char faults[128];
+        BmsSeverity sev;
+        decode_faults_for_ui(&me->last, faults, sizeof(faults), &sev);
+        strncpy(ce->errors, faults, sizeof(ce->errors)-1);
+        ce->errors[sizeof(ce->errors)-1] = '\0';
+    }
+
+    // PSU snapshot (you already cache these)
+    ce->psu_present = me->psu_present;
+    ce->psu_out_on  = me->psu_out_on;
+    ce->psu_v_out   = me->psu_v_out;
+    ce->psu_i_out   = me->psu_i_out;
+    ce->psu_temp    = me->psu_temp;
+
+    if (!QACTIVE_POST_X(AO_Nextion, &ce->super, QF_NO_MARGIN, &me->super)) {
+        QF_gc(&ce->super);
+    }
+}
 
 // --- HMI: PSU widget helper (same style as post_summary/post_details) ---
 static void post_psu_to_hmi(uint8_t present, uint8_t output_on,
@@ -500,6 +570,36 @@ static void post_psu_to_hmi(uint8_t present, uint8_t output_on,
 }
 
 static bool in_charge;
+// stop charging helper
+static void ctl_request_stop(ControllerAO *me, ChargeStopReason r, const char *txt) {
+    if (me->stop_issued) {
+        return; // already stopping/stopped
+    }
+    me->stop_issued = 1U;
+    me->last_stop_reason = r;
+
+    if (txt && txt[0]) {
+        strncpy(me->last_stop_text, txt, sizeof(me->last_stop_text)-1);
+        me->last_stop_text[sizeof(me->last_stop_text)-1] = '\0';
+    } else {
+        me->last_stop_text[0] = '\0';
+    }
+
+    ChargingStoppedEvt *ev = Q_NEW(ChargingStoppedEvt, CHARGING_STOPPED_SIG);
+    ev->reason = r;
+    ev->when_ms = HAL_GetTick();
+    if (me->last_stop_text[0]) {
+        strncpy(ev->text, me->last_stop_text, sizeof(ev->text)-1);
+        ev->text[sizeof(ev->text)-1] = '\0';
+    } else {
+        ev->text[0] = '\0';
+    }
+
+    // post to ourselves: single stop handling path
+    if (!QACTIVE_POST_X(&me->super, &ev->super, QF_NO_MARGIN, &me->super)) {
+        QF_gc(&ev->super);
+    }
+}
 
 static void post_page_ex(ControllerAO *me, uint8_t page) {
     // keep our own notion of the current page in sync
@@ -591,6 +691,8 @@ void ControllerAO_ctor(void) {
     QTimeEvt_ctorX(&l_ctl.tCharge, &l_ctl.super, CHARGE_TIMEOUT_SIG, 0U);
     QTimeEvt_ctorX(&l_ctl.tPsuOff, &l_ctl.super, PSU_OFF_WAIT_TO_SIG, 0U);
     QTimeEvt_ctorX(&l_ctl.tLostHold, &l_ctl.super, LOST_HOLD_TO_SIG, 0U);
+    QTimeEvt_ctorX(&l_ctl.tChargeMon, &l_ctl.super, CHARGE_MON_TICK_SIG, 0U);
+
 }
 
 /* states */
@@ -671,6 +773,9 @@ static QState Ctl_run(ControllerAO * const me, QEvt const * const e) {
         if (me->page == 2U) {
             post_psu_to_hmi(me->psu_present, me->psu_out_on,
                             me->psu_v_out, me->psu_i_out, me->psu_temp);
+        }
+        if (me->state == CTL_STATE_CHARGE) {
+            post_charging_page(me, 0U);
         }
         return Q_HANDLED();
     }
@@ -786,11 +891,12 @@ static QState Ctl_run(ControllerAO * const me, QEvt const * const e) {
 /* -------- WAIT FOR BATTERY -------- */
 static QState Ctl_wait(ControllerAO * const me, QEvt const * const e) {
     switch (e->sig) {
-    // case Q_ENTRY_SIG:
-    //     {
-    //         //printf("Ctl_wait: entry\r\n");
-    //         //me->state = CTL_STATE_WAIT;
-    //     }
+    case Q_ENTRY_SIG: {
+
+            printf("Ctl_wait: entry\r\n");
+                //me->state = CTL_STATE_WAIT;
+            return Q_HANDLED();
+        }
     case BMS_UPDATED_SIG: {
             BmsTelemetryEvt const *be = Q_EVT_CAST(BmsTelemetryEvt);
             me->haveData = 1U;
@@ -939,9 +1045,14 @@ static QState Ctl_detect(ControllerAO * const me, QEvt const * const e) {
 static QState Ctl_charge(ControllerAO * const me, QEvt const * const e) {
     switch (e->sig) {
         case Q_ENTRY_SIG: {
+            me->stop_issued = 0U;
             me->state = CTL_STATE_CHARGE;
+            me->charge_start_ms = HAL_GetTick();
+            me->charge_total_s  = 30U; // your current tCharge duration
             in_charge = true;
             ctl_update_outputs(me);   // forces green
+            me->latch_prev = BSP_isStartPressed() ? 1U : 0U;   // latch feedback pin
+            QTimeEvt_armX(&me->tChargeMon, BSP_TICKS_PER_SEC/50U, BSP_TICKS_PER_SEC/50U); // 20ms
             printf("Ctl_charge: entry\r\n");
 #if !defined(ENABLE_BMS_SIM)
             // === REAL BATTERIES ONLY ===
@@ -976,6 +1087,7 @@ static QState Ctl_charge(ControllerAO * const me, QEvt const * const e) {
                 QF_gc(&se->super);
             }
             post_summary(me, true, "charging");
+            post_charging_page(me, 1U);  // force page to pCharging
             QTimeEvt_armX(&me->tCharge, 30U * BSP_TICKS_PER_SEC, 0U);
             return Q_HANDLED();
         }
@@ -985,6 +1097,22 @@ static QState Ctl_charge(ControllerAO * const me, QEvt const * const e) {
             me->state = CTL_STATE_DETECT;
             ctl_update_outputs(me);
             QTimeEvt_disarm(&me->tCharge);
+            QTimeEvt_disarm(&me->tChargeMon);
+            post_page_ex(me, 2U);                 // pMain
+            post_summary_force(me, false, "ready to charge");
+
+            return Q_HANDLED();
+        }
+        case CHARGE_MON_TICK_SIG: {
+            uint8_t now = BSP_isStartPressed() ? 1U : 0U;
+
+            if (me->latch_prev == 1U && now == 0U) {
+                // latch opened: charging power chain opened
+                // classify it as generic latch open (best hardware truth)
+                ctl_request_stop(me, CHG_STOP_LATCH_OPEN, "Latch opened");
+            }
+
+            me->latch_prev = now;
             return Q_HANDLED();
         }
         case BMS_UPDATED_SIG: {
@@ -992,71 +1120,102 @@ static QState Ctl_charge(ControllerAO * const me, QEvt const * const e) {
             me->last = be->data; me->haveData = 1U;
 
             /* guard: temp < 35C and no new errors */
-            if (me->last.sys_temp_high_C > 35.0f || me->last.last_error_class) {
-                QEvt *off = Q_NEW(QEvt, PSU_REQ_OFF_SIG);
-                // UI/PSU requests are “best effort”: use margin 0U and GC if it can’t be queued right now
-                if (!QACTIVE_POST_X(AO_Cotek, off, QF_NO_MARGIN, 0U)) {
-                    QF_gc(off);
-                }
-                post_summary(me, false,
-                    (me->last.sys_temp_high_C > 35.0f) ? "Stopped: temp > 35C"
-                                                       : "Stopped: new error");
-                printf("Ctl_charge: BMS_UPDATE_SIG - High temp or error detected\r\n");
-                return Q_TRAN(&Ctl_detect);
+            if (me->last.sys_temp_high_C > 40.0f || me->last.last_error_class) {
+                ctl_request_stop(me, CHG_STOP_BMS_CRITICAL,
+                                 (me->last.sys_temp_high_C > 35.0f) ? "Temp > 35C" : "BMS error");
+                return Q_HANDLED();
             }
+            // if (me->last.sys_temp_high_C > 35.0f || me->last.last_error_class) {
+            //     QEvt *off = Q_NEW(QEvt, PSU_REQ_OFF_SIG);
+            //     // UI/PSU requests are “best effort”: use margin 0U and GC if it can’t be queued right now
+            //     if (!QACTIVE_POST_X(AO_Cotek, off, QF_NO_MARGIN, 0U)) {
+            //         QF_gc(off);
+            //     }
+            //     post_summary(me, false,
+            //         (me->last.sys_temp_high_C > 35.0f) ? "Stopped: temp > 35C"
+            //                                            : "Stopped: new error");
+            //     printf("Ctl_charge: BMS_UPDATE_SIG - High temp or error detected\r\n");
+            //     return Q_TRAN(&Ctl_detect);
+            // }
             /* refresh UI while charging */
             post_summary(me, true, "charging");
             return Q_HANDLED();
         }
         case BMS_CONN_LOST_SIG: {
-            /* NEW: wipe last-known telemetry so UI can’t reuse stale numbers */
-            memset(&me->last, 0, sizeof(me->last));
-
-            post_summary(me, false, "Stopped: BMS lost");
-            // ensure page and comms-lost banner + warn icon
-            if (me->page == 3U) { post_page_ex(me, 2U); }
-            post_comms_lost(me);
-            QTimeEvt_armX(&me->tLostHold, 10U * BSP_TICKS_PER_SEC, 0U);
-            /* 1) ask PSU to turn OFF */
-            QEvt *off = Q_NEW(QEvt, PSU_REQ_OFF_SIG);
-            // UI/PSU requests are “best effort”: use margin 0U and GC if it can’t be queued right now
-            if (!QACTIVE_POST_X(AO_Cotek, off, QF_NO_MARGIN, 0U)) {
-                QF_gc(off);
-            }
-            // /* 2) start short timeout (e.g., 500 ms) as a guard */
-            // QTimeEvt_armX(&me->tPsuOff, 50U, 0U);   /* assuming your tick is 10ms */
-            /* 3) go wait for OFF confirmation */
-            return Q_TRAN(&Ctl_poweringDown);
+            ctl_request_stop(me, CHG_STOP_TIMEOUT_SW, " Software Timeout");
+            return Q_HANDLED();
+            // /* NEW: wipe last-known telemetry so UI can’t reuse stale numbers */
+            // memset(&me->last, 0, sizeof(me->last));
+            //
+            // post_summary(me, false, "Stopped: BMS lost");
+            // // ensure page and comms-lost banner + warn icon
+            // if (me->page == 3U) { post_page_ex(me, 2U); }
+            // post_comms_lost(me);
+            // QTimeEvt_armX(&me->tLostHold, 10U * BSP_TICKS_PER_SEC, 0U);
+            // /* 1) ask PSU to turn OFF */
+            // QEvt *off = Q_NEW(QEvt, PSU_REQ_OFF_SIG);
+            // // UI/PSU requests are “best effort”: use margin 0U and GC if it can’t be queued right now
+            // if (!QACTIVE_POST_X(AO_Cotek, off, QF_NO_MARGIN, 0U)) {
+            //     QF_gc(off);
+            // }
+            // // /* 2) start short timeout (e.g., 500 ms) as a guard */
+            // // QTimeEvt_armX(&me->tPsuOff, 50U, 0U);   /* assuming your tick is 10ms */
+            // /* 3) go wait for OFF confirmation */
+            // return Q_TRAN(&Ctl_poweringDown);
         }
         case CHARGE_TIMEOUT_SIG: {
-            printf("Ctl_charge: Charge_timeout_sig\r\n");
-            // Ask PSU to turn OFF, then wait for confirmation in the substate
-            QEvt *off = Q_NEW(QEvt, PSU_REQ_OFF_SIG);
-#if         defined(ENABLE_BMS_SIM)
-            // SIM: no PSU handshake, go straight back to DETECT
-            return Q_TRAN(&Ctl_detect);
-#else       if (!QACTIVE_POST_X(AO_Cotek, off, QF_NO_MARGIN, 0U)) {
-                QF_gc(off);
-            }
-            post_summary(me, false, "Stopped: 30s timeout");
-            return Q_TRAN(&Ctl_poweringDown);
-#endif
+            ctl_request_stop(me, CHG_STOP_TIMEOUT_SW, " Software Timeout");
+            return Q_HANDLED();
+//             printf("Ctl_charge: Charge_timeout_sig\r\n");
+//             // Ask PSU to turn OFF, then wait for confirmation in the substate
+//             QEvt *off = Q_NEW(QEvt, PSU_REQ_OFF_SIG);
+// #if         defined(ENABLE_BMS_SIM)
+//             // SIM: no PSU handshake, go straight back to DETECT
+//             return Q_TRAN(&Ctl_detect);
+// #else       if (!QACTIVE_POST_X(AO_Cotek, off, QF_NO_MARGIN, 0U)) {
+//                 QF_gc(off);
+//             }
+//             post_summary(me, false, "Stopped: 30s timeout");
+//             return Q_TRAN(&Ctl_poweringDown);
+// #endif
 
         }
         case STOPBUTTON_PRESSED_SIG: {
+            // We *expect* latch to open; still log “user stop” as the reason
+            ctl_request_stop(me, CHG_STOP_USER, "Stopped by user");
+            return Q_HANDLED();
 
-            post_summary(me, false, "Stopped: user");
-#if         defined(ENABLE_BMS_SIM)
-            // SIM: no PSU handshake, go straight back to DETECT
-            return Q_TRAN(&Ctl_detect);
+//             post_summary(me, false, "Stopped: user");
+// #if         defined(ENABLE_BMS_SIM)
+//             // SIM: no PSU handshake, go straight back to DETECT
+//             return Q_TRAN(&Ctl_wait);
+// #else
+//             QEvt *off = Q_NEW(QEvt, PSU_REQ_OFF_SIG);
+//             if (!QACTIVE_POST_X(AO_Cotek, off, QF_NO_MARGIN, 0U)) {
+//                 QF_gc(off);
+//             }
+//             post_summary(me, false, "changing state to PoweringDown");
+//             // ctl_outputs_all_off();
+//             // ctl_outputs_ready_blue();
+//             return Q_TRAN(&Ctl_poweringDown);
+// #endif
+        }
+        case CHARGING_STOPPED_SIG: {
+            ChargingStoppedEvt const *st = (ChargingStoppedEvt const *)e;
+
+            // Update UI immediately
+            post_summary_force(me, false, st->text[0] ? st->text : "stopping...");
+
+#if defined(ENABLE_BMS_SIM)
+            // SIM: no real PSU handshake
+            post_page_ex(me, 2U);
+            return Q_TRAN(&Ctl_wait);
 #else
+            // REAL: command PSU OFF then go poweringDown to wait for confirmation
             QEvt *off = Q_NEW(QEvt, PSU_REQ_OFF_SIG);
             if (!QACTIVE_POST_X(AO_Cotek, off, QF_NO_MARGIN, 0U)) {
                 QF_gc(off);
             }
-            post_summary(me, false, "changing state to PoweringDown");
-            // ctl_outputs_all_off();
-            // ctl_outputs_ready_blue();
             return Q_TRAN(&Ctl_poweringDown);
 #endif
         }
@@ -1069,7 +1228,9 @@ static QState Ctl_charge(ControllerAO * const me, QEvt const * const e) {
 static QState Ctl_poweringDown(ControllerAO * const me, QEvt const * const e) {
     switch (e->sig) {
         case Q_ENTRY_SIG: {
-            post_summary(me, false, "entering the state PoweringDown");
+            post_page_ex(me, 2U);  // to be replaced with the number of the STOPCHARGING page
+            post_summary_force(me, false,
+                me->last_stop_text[0] ? me->last_stop_text : "Stopped");  // to be replaced with the helper for the StopCharging Page
             me->state = CTL_STATE_DETECT;   // we are no longer charging logically
             ctl_update_outputs(me);         // blue while stopping (if allowed)
             // Ask PSU to turn OFF
@@ -1080,7 +1241,7 @@ static QState Ctl_poweringDown(ControllerAO * const me, QEvt const * const e) {
             }
 
             // Start a short watchdog while waiting for confirmation.
-            // 200ms is typical; tune as you like.
+            // 200ms
             QTimeEvt_disarm(&me->tPsuOff);
             QTimeEvt_armX(&me->tPsuOff, BSP_TICKS_PER_SEC / 5U, 0U);
             // psuoff_start(me,20U);
@@ -1101,8 +1262,9 @@ static QState Ctl_poweringDown(ControllerAO * const me, QEvt const * const e) {
                 post_psu_to_hmi(/*present=*/1U, /*output_on=*/0U,
                 se->v_out, se->i_out, se->t_out);
                 QTimeEvt_disarm(&me->tPsuOff);
+                post_page_ex(me, 2U);           // back to pMain
                 post_summary(me, false, "power off confirmed");
-                return Q_TRAN(&Ctl_detect);
+                return Q_TRAN(&Ctl_wait);
             }
 
             // Still ON; keep waiting.

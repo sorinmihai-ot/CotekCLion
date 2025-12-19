@@ -41,6 +41,7 @@ enum AppSignals {
     NEX_REQ_UPDATE_SUMMARY_SIG,/* Controller -> Nextion*/
     NEX_REQ_UPDATE_LIVE_SIG,
     NEX_REQ_UPDATE_DETAILS_SIG,
+    NEX_REQ_UPDATE_CHARGE_SIG,
     NEX_REQ_UPDATE_PSU_SIG,
         /* PSU control/status (direct posts) */
     PSU_REQ_SETPOINT_SIG,      /* Controller -> Cotek                        */
@@ -51,8 +52,11 @@ enum AppSignals {
     COTEK_TICK_SIG,
 
     /* Board button (direct posts) */
-    BUTTON_PRESSED_SIG,
-    BUTTON_RELEASED_SIG,
+    BUTTON_PRESSED_SIG,          // old signals
+    BUTTON_RELEASED_SIG,         // old signals
+
+    CHARGE_MON_TICK_SIG,      // fast monitor tick (e.g. 20ms) for latch edge detect
+    CHARGING_STOPPED_SIG,     // unified stop event
 };
 
 
@@ -164,10 +168,45 @@ typedef struct {
     float     psu_v;         // volts
     float     psu_i;         // amps
     float     psu_t;         // degC
+    uint8_t interlock_ok;   // 1 = Closed/OK, 0 = Open
 
     // Optional “reason” breadcrumb you print to UART only
     char      reason[96];
 } NextionSummaryEvt;
+//  ----Charging page event ----------
+typedef struct {
+    QEvt super;
+
+    // page control
+    uint8_t show_page;       // 1 = force pCharging, 0 = don't force
+
+    // mode/status
+    uint8_t is_recovery;     // 1=recovery, 0=charging
+    char    bms_state[24];   // text shown in tBmsState
+    char    errors[96];      // text shown in tErrors (readable)
+
+    // timers (seconds)
+    uint16_t time_left_s;    // for tTimeLeft
+    uint16_t elapsed_s;      // for tPsuOnline
+
+    // Battery telemetry (strings or numbers)
+    float pack_v;            // tPackV
+    float h_v;               // tHVolt
+    float l_v;               // tLVolt
+    float a_v;               // tAVolt
+    float h_t;               // tHTemp
+    float l_t;               // tLTemp
+    float pack_h_t;          // tPackHTemp
+    float pack_l_t;          // tPackLTemp
+    uint8_t soc;             // tSoC
+
+    // PSU status
+    uint8_t psu_present;     // tPsu + color
+    uint8_t psu_out_on;      // tOutState + color
+    float   psu_v_out;       // tOutV
+    float   psu_i_out;       // tOutI
+    float   psu_temp;        // tPsuTemp
+} NextionChargeEvt;
 // ----- details shown on pDetails -----
 typedef struct {
     QEvt super;
@@ -217,6 +256,26 @@ typedef struct {
     float cotek_I;          // A (readback)
     int16_t cotek_T;        // C (optional)
 } NextionLiveEvt;
+
+// ------Charging Stopped---------------
+typedef enum {
+    CHG_STOP_NONE = 0,
+    CHG_STOP_USER,           // stop button
+    CHG_STOP_TIMEOUT_SW,     // your QTimeEvt tCharge expired
+    CHG_STOP_TIMEOUT_HW,     // PSU power removed / hardware timer expired
+    CHG_STOP_BMS_CRITICAL,   // faults/temp/errors
+    CHG_STOP_LOST_COMS_BMS,  // lost comms with the bms
+    CHG_STOP_CELL_UV,        // cell voltage below threshold
+    CHG_STOP_LATCH_OPEN,     // latch feedback went low (generic electrical / stop happened)
+    CHG_STOP_ELECTRICAL      // other electrical abnormality
+} ChargeStopReason;
+
+typedef struct {
+    QEvt super;
+    ChargeStopReason reason;
+    uint32_t when_ms;
+    char text[48];           // short, readable reason
+} ChargingStoppedEvt;
 
 /* compile-time sanity */
 Q_ASSERT_COMPILE(sizeof(CanFrameEvt)     >= sizeof(QEvt));
