@@ -9,6 +9,11 @@
 #include "app_signals.h"
 #include "qpc.h"
 
+#ifdef ENABLE_BMS_SIM
+void BmsSim_setCharging(uint8_t on);
+#endif
+
+
 #ifdef __cplusplus
 extern "C" {
 #endif

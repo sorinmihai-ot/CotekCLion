@@ -64,6 +64,27 @@ static void nex_send_textf(const char *fmt, ...) {
 
 /* ========= API ========= */
 void Nextion_OnRx(uint8_t const *buf, uint16_t len) {
+    // 0x65: Touch event: 0x65 pageId compId event
+    if (len >= 4 && buf[0] == 0x65) {
+        uint8_t page = buf[1];
+        uint8_t comp = buf[2];
+        uint8_t ev   = buf[3]; // 0=release, 1=press
+
+        // Only act on release to avoid double triggers
+        if (ev == 0U) {
+            // pStopCharging page id = 5 (change if needed)
+            // bBackMain component id must match your Nextion component ID
+            // (check in Editor: the "objname" list shows ID)
+            const uint8_t STOP_PAGE_ID = 5U;
+            const uint8_t BACK_BTN_ID  = 15U;   // <-- CHANGE THIS to bBackMain's component ID
+
+            if (page == STOP_PAGE_ID && comp == BACK_BTN_ID) {
+                (void)QACTIVE_POST_X(AO_Controller, Q_NEW(QEvt, NEX_BACK_MAIN_SIG), 1U, 0U);
+            }
+        }
+        return;
+    }
+    // Existing: sendme page id (0x66)
     if (len >= 2 && buf[0] == 0x66) {
         uint8_t pid = buf[1];
         NextionPageEvt *pg = Q_NEW(NextionPageEvt, NEX_REQ_SHOW_PAGE_SIG);
@@ -130,6 +151,7 @@ static QState Nex_active(NextionAO * const me, QEvt const * const e) {
                 break;
             case 3: nex_send3("page pDetails"); break;
             case 4: nex_send3("page pCharging"); break;
+            case 5: nex_send3("page pStopCharging"); break;
             default: break;
         }
         l_nex.cur_page = pe->page;
@@ -179,7 +201,6 @@ static QState Nex_active(NextionAO * const me, QEvt const * const e) {
         nex_send3("ref pMain.tInterStatus");
         return Q_HANDLED();
     }
-
     case NEX_REQ_UPDATE_PSU_SIG: {
         NextionPsuEvt const *pe = Q_EVT_CAST(NextionPsuEvt);
         nex_send_textf("pMain.tPsu.txt=\"PSU: %s\"", pe->present ? "Detected" : "Missing");
@@ -192,7 +213,6 @@ static QState Nex_active(NextionAO * const me, QEvt const * const e) {
         nex_sendf("pMain.tOutState.bco=%u", pe->output_on ? 2016U : 63488U);
         return Q_HANDLED();
     }
-
     case NEX_REQ_UPDATE_DETAILS_SIG: {
         NextionDetailsEvt const *de = Q_EVT_CAST(NextionDetailsEvt);
 
@@ -216,7 +236,6 @@ static QState Nex_active(NextionAO * const me, QEvt const * const e) {
         nex_send_textf("pDetails.tBmsFault.txt=\"BMS_fault: %s\"", de->bms_fault_str);
         return Q_HANDLED();
     }
-
     case NEX_REQ_UPDATE_CHARGE_SIG: {
         NextionChargeEvt const *ce = Q_EVT_CAST(NextionChargeEvt);
 
@@ -264,7 +283,41 @@ static QState Nex_active(NextionAO * const me, QEvt const * const e) {
 
     return Q_HANDLED();
 }
+    case NEX_REQ_UPDATE_STOP_SIG: {
+        NextionStopEvt const *st = Q_EVT_CAST(NextionStopEvt);
 
+        // Reason
+        if (st->reason[0]) nex_send_textf("pStopCharging.tReason.txt=\"%s\"", st->reason);
+        else               nex_send3("pStopCharging.tReason.txt=\"-\"");
+
+        // Pack voltage / Low cell
+        nex_send_textf("pStopCharging.tPackV.txt=\"%.2f V\"", (double)st->packV);
+        nex_send_textf("pStopCharging.tLVolt.txt=\"%.2f V\"", (double)st->lowCellV);
+
+        // BMS state
+        if (st->bms_state[0]) nex_send_textf("pStopCharging.tBmsState.txt=\"%s\"", st->bms_state);
+        else                  nex_send3("pStopCharging.tBmsState.txt=\"-\"");
+
+        // Interlock
+        nex_send_textf("pStopCharging.tInterStatus.txt=\"%s\"",
+                       st->interlock_ok ? "Closed" : "Open");
+        nex_sendf("pStopCharging.tInterStatus.bco=%u",
+                  st->interlock_ok ? 2016U : 63488U);
+        nex_send3("ref pStopCharging.tInterStatus");
+
+        // Errors
+        if (st->errors[0]) nex_send_textf("pStopCharging.tErrors.txt=\"%s\"", st->errors);
+        else               nex_send3("pStopCharging.tErrors.txt=\"None\"");
+
+        // Charge length: mm:ss
+        uint32_t s = st->charge_len_s;
+        uint32_t mm = s / 60U;
+        uint32_t ss = s % 60U;
+        nex_send_textf("pStopCharging.tChgLenght.txt=\"%lu:%02lu\"",
+                       (unsigned long)mm, (unsigned long)ss);
+
+        return Q_HANDLED();
+        }
     default: break;
     }
     return Q_SUPER(&QHsm_top);

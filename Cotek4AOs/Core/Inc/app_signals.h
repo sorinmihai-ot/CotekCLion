@@ -43,6 +43,10 @@ enum AppSignals {
     NEX_REQ_UPDATE_DETAILS_SIG,
     NEX_REQ_UPDATE_CHARGE_SIG,
     NEX_REQ_UPDATE_PSU_SIG,
+    // Nextion -> Controller
+    NEX_BACK_MAIN_SIG,
+    // Controller -> Nextion
+    NEX_REQ_UPDATE_STOP_SIG,
         /* PSU control/status (direct posts) */
     PSU_REQ_SETPOINT_SIG,      /* Controller -> Cotek                        */
     PSU_REQ_OFF_SIG,           /* Controller -> Cotek                        */
@@ -257,6 +261,19 @@ typedef struct {
     int16_t cotek_T;        // C (optional)
 } NextionLiveEvt;
 
+typedef struct {
+    QEvt super;
+
+    char reason[48];
+    float packV;
+    float lowCellV;
+    char bms_state[24];
+    uint8_t interlock_ok;
+    char errors[96];
+
+    uint32_t charge_len_s;   // seconds
+} NextionStopEvt;
+
 // ------Charging Stopped---------------
 typedef enum {
     CHG_STOP_NONE = 0,
@@ -264,10 +281,11 @@ typedef enum {
     CHG_STOP_TIMEOUT_SW,     // your QTimeEvt tCharge expired
     CHG_STOP_TIMEOUT_HW,     // PSU power removed / hardware timer expired
     CHG_STOP_BMS_CRITICAL,   // faults/temp/errors
-    CHG_STOP_LOST_COMS_BMS,  // lost comms with the bms
+    CHG_STOP_LOST_COMMS_BMS,  // lost comms with the bms
     CHG_STOP_CELL_UV,        // cell voltage below threshold
     CHG_STOP_LATCH_OPEN,     // latch feedback went low (generic electrical / stop happened)
-    CHG_STOP_ELECTRICAL      // other electrical abnormality
+    CHG_STOP_ELECTRICAL,      // other electrical abnormality
+    CHG_STOP_PACK_GT_PSU      // Pack total voltage greater than PSU output voltage
 } ChargeStopReason;
 
 typedef struct {
