@@ -24,7 +24,7 @@
 // 4 = comms lost (no telemetry + BMS_CONN_LOST_SIG once)
 // 5 = pack voltage high (ONLY useful if Controller checks pack>PSU using Cotek reading)
 #ifndef BMS_SIM_INJECT
-#define BMS_SIM_INJECT  1
+#define BMS_SIM_INJECT  0
 #endif
 
 // Delay before fault injection starts

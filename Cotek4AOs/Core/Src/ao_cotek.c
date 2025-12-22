@@ -63,7 +63,7 @@ typedef struct {
     uint8_t startup_sync;   /* 1 = we are confirming OFF at boot */
     uint8_t off_acks;       /* consecutive reads showing output OFF */
     // --- NEW: boot gating / buffering ---
-    uint8_t boot_ticks_left;     // used in Cotek_UP
+    uint8_t boot_ticks_left;     // used in Cotek_Power_up_delay
     uint8_t pending_setpoint;    // 1 if we received PSU_REQ_SETPOINT while not ready
     float   pend_vset, pend_iset;
 } CotekAO;
@@ -74,7 +74,7 @@ QActive *AO_Cotek = &l_psu.super;
 /* ===== Forward declarations of states ===== */
 static QState Cotek_qp_initial (CotekAO *me, void const *par);
 static QState Cotek_off        (CotekAO *me, QEvt const *e);
-static QState Cotek_up         (CotekAO *me, QEvt const *e);
+static QState Cotek_Power_up_delay         (CotekAO *me, QEvt const *e);
 static QState Cotek_initial(CotekAO *me, QEvt const *e);
 static QState Cotek_active (CotekAO *me, QEvt const *e);
 
@@ -211,7 +211,7 @@ static QState Cotek_off(CotekAO * const me, QEvt const * const e) {
         case STARTBUTTON_PRESSED_SIG: {
             /* AC will be enabled externally by your wiring */
             printf("COTEK: Start pressed -> state=UP (boot wait)\r\n");
-            return Q_TRAN(&Cotek_up);
+            return Q_TRAN(&Cotek_Power_up_delay);
         }
 
         case STOPBUTTON_PRESSED_SIG: {
@@ -240,15 +240,15 @@ static QState Cotek_off(CotekAO * const me, QEvt const * const e) {
     return Q_SUPER(&QHsm_top);
 }
 
-/* ===== COTEK_UP: wait ~3s for Cotek to boot after AC enabled ===== */
-static QState Cotek_up(CotekAO * const me, QEvt const * const e) {
+/* ===== Cotek_Power_up_delay: wait ~3s for Cotek to boot after AC enabled ===== */
+static QState Cotek_Power_up_delay(CotekAO * const me, QEvt const * const e) {
     switch (e->sig) {
         case Q_ENTRY_SIG: {
             /* 3s boot timer using the 500ms tick */
             me->boot_ticks_left = COTEK_BOOT_TICKS_3S;
 
             /* ensure we publish “not present yet” during boot */
-            psu_mark_offline(me, "state=UP (waiting for Cotek boot)");
+            psu_mark_offline(me, "state=UP delay(waiting for Cotek boot)");
 
             /* start tick for countdown */
             QTimeEvt_armX(&me->tick, COTEK_TICK_ARM_FIRST, COTEK_TICK_ARM_PERIOD);
@@ -278,6 +278,7 @@ static QState Cotek_up(CotekAO * const me, QEvt const * const e) {
 
         case COTEK_TICK_SIG: {
             if (me->boot_ticks_left > 0U) {
+                printf("COTEK: tick received %d remaining\r\n", me->boot_ticks_left);
                 --me->boot_ticks_left;
             }
             if (me->boot_ticks_left == 0U) {
@@ -390,6 +391,27 @@ static QState Cotek_active(CotekAO * const me, QEvt const * const e) {
             uint8_t new_present = (me->alive_ms <= 1000U) ? 1U : 0U;
             me->present = new_present;
 
+            if (me->present && me->pending_setpoint) {
+                me->pending_setpoint = 0U;
+
+                me->vset = me->pend_vset;
+                me->iset = me->pend_iset;
+                me->on   = 1U;
+
+                printf("COTEK: applying pending setpoint (present now) V=%.2f I=%.2f\r\n",
+                       (double)me->vset, (double)me->iset);
+
+                cotek_set_remote_mode();
+                cotek_set_output_voltage(me->vset);
+                cotek_set_output_current(me->iset);
+                cotek_commit_settings();
+                cotek_power_on();
+                me->out_on = 1U;
+
+                post_psu(me, 1U, 1U, me->vset, 0.0f, NAN);
+                publish_status(me);
+            }
+
             static uint8_t last_present = 0xFFU, last_out_on = 0xFFU;
             static float   last_v = -999.0f, last_i = -999.0f, last_t = -999.0f;
 
@@ -413,7 +435,12 @@ static QState Cotek_active(CotekAO * const me, QEvt const * const e) {
 
         case PSU_REQ_SETPOINT_SIG: {
             if (me->present == 0U) {
-                printf("COTEK: IGNORE setpoint (PSU not present)\r\n");
+                PsuSetEvt const *se = Q_EVT_CAST(PsuSetEvt);
+                me->pending_setpoint = 1U;
+                me->pend_vset = se->voltSet;
+                me->pend_iset = se->currSet;
+                printf("COTEK: buffered setpoint V=%.2f I=%.2f (not present yet)\r\n",
+                       (double)me->pend_vset, (double)me->pend_iset);
                 return Q_HANDLED();
             }
 

@@ -30,6 +30,9 @@ extern const char *BMS_state_to_text(uint16_t batt_type, uint8_t raw_state);
 #define PACK_PSU_GRACE_MS     3000U
 #define DEFAULT_CHARGE_TIME_S  (30U)
 
+#define PSU_ON_WAIT_MS         20000U   // how long we wait for PSU output ON
+#define PSU_VOUT_OK_MARGIN_V   1.0f    // acceptable difference between setpoint & measured vout
+
 Q_DEFINE_THIS_FILE
 typedef enum
 {
@@ -67,6 +70,10 @@ typedef struct {
     ChargeStopReason last_stop_reason;
     char     last_stop_text[48];
     char     stop_req_text[48];
+    QTimeEvt tPsuOnWait;      // NEW: watchdog while waiting for PSU output to turn ON
+    uint8_t  waiting_psu_on;  // NEW: 1 while waiting for output ON
+    float    cmd_vset;        // NEW: last commanded setpoints
+    float    cmd_iset;
 } ControllerAO;
 
 /* ===== START/STOP buttons + Relay(2/3/4) helper block =====
@@ -779,6 +786,7 @@ void ControllerAO_ctor(void) {
     QTimeEvt_ctorX(&l_ctl.tPsuOff, &l_ctl.super, PSU_OFF_WAIT_TO_SIG, 0U);
     QTimeEvt_ctorX(&l_ctl.tLostHold, &l_ctl.super, LOST_HOLD_TO_SIG, 0U);
     QTimeEvt_ctorX(&l_ctl.tChargeMon, &l_ctl.super, CHARGE_MON_TICK_SIG, 0U);
+    QTimeEvt_ctorX(&l_ctl.tPsuOnWait, &l_ctl.super, PSU_ON_WAIT_TO_SIG, 0U);
 
 }
 
@@ -1134,7 +1142,7 @@ static QState Ctl_charge(ControllerAO * const me, QEvt const * const e) {
         case Q_ENTRY_SIG: {
 #ifdef ENABLE_BMS_SIM
             BmsSim_setCharging(1U);
-#endif
+        #endif
 
             me->stop_issued = 0U;
             me->stop_req_reason = CHG_STOP_NONE;
@@ -1145,73 +1153,147 @@ static QState Ctl_charge(ControllerAO * const me, QEvt const * const e) {
             me->state = CTL_STATE_CHARGE;
             me->charge_start_ms = HAL_GetTick();
 
-            me->sw_total_s = DEFAULT_CHARGE_TIME_S;              // your SW timer
+            me->sw_total_s = DEFAULT_CHARGE_TIME_S;
             me->charge_total_s = me->sw_total_s;
 
-            me->hw_extra_s = 60U;              // your +1 minute rule
+            me->hw_extra_s = 60U;
             me->hw_deadline_ms = me->charge_start_ms
                                + (uint32_t)(me->sw_total_s + me->hw_extra_s) * 1000U;
 
             in_charge = true;
             ctl_update_outputs(me);
 
-            // latch feedback pin
             me->latch_prev = BSP_isStartPressed() ? 1U : 0U;
-
-            // 20ms poll for falling edge
             QTimeEvt_armX(&me->tChargeMon, BSP_TICKS_PER_SEC/50U, BSP_TICKS_PER_SEC/50U);
 
             printf("Ctl_charge: entry\r\n");
-#if !defined(ENABLE_BMS_SIM)
-            // === REAL BATTERIES ONLY ===
-            BattClassResult cr = batt_classify(&me->last, /*bms_sim_active=*/false);
 
             float v_set = 48.0f;
             float i_set = 1.0f;
 
+        #if !defined(ENABLE_BMS_SIM)
+            BattClassResult cr = batt_classify(&me->last, /*bms_sim_active=*/false);
+
             if (cr.cls == BATT_CLASS_NOT_RECOVERABLE) {
                 post_summary(me, false, "Blocked: Not Recoverable");
-                return Q_TRAN(&Ctl_detect);  // do not arm timer, do not command PSU
+                return Q_TRAN(&Ctl_detect);
             } else if (cr.cls == BATT_CLASS_RECOVERABLE) {
-                i_set = 1.0f;  // 48V / 1A
+                i_set = 1.0f;
             } else if (cr.cls == BATT_CLASS_OPERATIONAL) {
-                i_set = 3.0f;  // 48V / 3A
+                i_set = 3.0f;
             } else {
                 post_summary(me, false, "Unknown class – cannot charge");
                 return Q_TRAN(&Ctl_detect);
             }
-#else
-            // === SIM BUILD === (previous default used in your code)
-            float v_set = 48.0f;
-            float i_set = 1.0f;
-#endif
+        #else
+            // SIM build default
+            v_set = 48.0f;
+            i_set = 1.0f;
+        #endif
 
-            printf("CTL: start charging V=%.1f I=%.1f (30s)\r\n", (double)v_set, (double)i_set);
+            // Store the FINAL command values (after decisions)
+            me->cmd_vset = v_set;
+            me->cmd_iset = i_set;
 
+            printf("CTL: request PSU V=%.1f I=%.1f\r\n", (double)v_set, (double)i_set);
+
+            // We are WAITING for PSU to actually turn output on
+            me->waiting_psu_on = 1U;
+
+            // Send setpoint request to CotekAO (works in SIM and non-SIM)
             PsuSetEvt *se = Q_NEW(PsuSetEvt, PSU_REQ_SETPOINT_SIG);
             se->voltSet = v_set;
             se->currSet = i_set;
             if (!QACTIVE_POST_X(AO_Cotek, &se->super, QF_NO_MARGIN, 0U)) {
                 QF_gc(&se->super);
             }
-            post_summary(me, true, "charging");
-            post_charging_page(me, 1U);  // force page to pCharging
-            QTimeEvt_armX(&me->tCharge, me->sw_total_s * BSP_TICKS_PER_SEC, 0U);
+
+            // UI: show "starting" (NOT charging yet)
+            post_summary(me, true, "starting PSU...");
+            post_charging_page(me, 1U);
+
+            // Arm PSU-on watchdog (you must have created/constructed tPsuOnWait)
+            QTimeEvt_disarm(&me->tPsuOnWait);
+            QTimeEvt_armX(&me->tPsuOnWait,
+                          (PSU_ON_WAIT_MS * BSP_TICKS_PER_SEC) / 1000U,
+                          0U);
+
+            // IMPORTANT: do NOT arm me->tCharge here
             return Q_HANDLED();
         }
         case Q_EXIT_SIG: {
             in_charge = false;
             printf("Ctl_charge: exit\r\n");
             me->state = CTL_STATE_DETECT;
-            ctl_update_outputs(me);
+            ctl_outputs_all_off();     // RM2, RM3, RM4 are off
             QTimeEvt_disarm(&me->tCharge);
             QTimeEvt_disarm(&me->tChargeMon);
+            QTimeEvt_disarm(&me->tPsuOnWait);
+            me->waiting_psu_on = 0U;
             // post_page_ex(me, 2U);                 // pMain
             // post_summary_force(me, false, "ready to charge");
 #ifdef ENABLE_BMS_SIM
             BmsSim_setCharging(0U);
 #endif
 
+            return Q_HANDLED();
+        }
+        case PSU_RSP_STATUS_SIG: {
+            CotekStatusEvt const *se = (CotekStatusEvt const *)e;
+            printf("CTL: PSU_RSP_STATUS_SIG entry\r\n");
+            // cache
+            me->psu_present = se->present;
+            me->psu_out_on  = se->out_on ? 1U : 0U;
+            me->psu_v_out   = se->v_out;
+            me->psu_i_out   = se->i_out;
+            me->psu_temp    = se->t_out;
+
+            post_charging_page(me, 0U);
+            printf("CTL: PSU status present=%u out_on=%u v=%.2f cmd=%.2f wait=%u\r\n",
+                me->psu_present, me->psu_out_on,
+                (double)me->psu_v_out, (double)me->cmd_vset,
+                me->waiting_psu_on);
+            if (me->waiting_psu_on) {
+
+                // === Primary condition: output is ON ===
+                if (me->psu_present && me->psu_out_on) {
+                    printf("CTL: Cotek is on and output is on\r\n");
+                    // Stop the watchdog NOW
+                    me->waiting_psu_on = 0U;
+                    QTimeEvt_disarm(&me->tPsuOnWait);
+
+                    // Start SW charge timer NOW
+                    QTimeEvt_armX(&me->tCharge, me->sw_total_s * BSP_TICKS_PER_SEC, 0U);
+
+                    // Optional: show a nicer message if Vout isn't close yet,
+                    // but DO NOT block the transition.
+                    if (me->psu_v_out > 1.0f &&
+                        fabsf(me->psu_v_out - me->cmd_vset) > PSU_VOUT_OK_MARGIN_V) {
+                        post_summary(me, true, "charging (PSU stabilising)");
+                        } else {
+                            post_summary(me, true, "charging");
+                        }
+
+                    printf("CTL: PSU confirmed ON -> charging started\r\n");
+                }
+            }
+
+            return Q_HANDLED();
+        }
+        case PSU_ON_WAIT_TO_SIG: {
+            if (me->waiting_psu_on) {
+                me->waiting_psu_on = 0U;
+
+                // Turn outputs off immediately (relay2 off is key here)
+                ctl_outputs_all_off();
+
+                // Request stop (choose a reason enum you have, or add one)
+                ctl_request_stop(me, CHG_STOP_ELECTRICAL, "Stopped: PSU failed to turn ON");
+
+                // You can either stay in charge and let CHARGING_STOPPED_SIG drive poweringDown,
+                // or transition immediately. Your current flow uses CHARGING_STOPPED_SIG:
+                return Q_HANDLED();
+            }
             return Q_HANDLED();
         }
         case CHARGE_MON_TICK_SIG: {
@@ -1349,8 +1431,13 @@ static QState Ctl_charge(ControllerAO * const me, QEvt const * const e) {
 // #endif
         }
         case CHARGING_STOPPED_SIG: {
+            ctl_outputs_all_off();   // RM2, RM3, RM4 are off
             ChargingStoppedEvt const *st = (ChargingStoppedEvt const *)e;
 #if defined(ENABLE_BMS_SIM)
+            QEvt *off = Q_NEW(QEvt, PSU_REQ_OFF_SIG);
+            if (!QACTIVE_POST_X(AO_Cotek, off, QF_NO_MARGIN, 0U)) {
+                QF_gc(off);
+            }
             return Q_TRAN(&Ctl_poweringDown);   // even in SIM, show stop page and wait for back
 #else
             QEvt *off = Q_NEW(QEvt, PSU_REQ_OFF_SIG);
@@ -1374,7 +1461,7 @@ static QState Ctl_poweringDown(ControllerAO * const me, QEvt const * const e) {
 
             // we are no longer charging logically
             me->state = CTL_STATE_DETECT;
-            ctl_update_outputs(me);  // blue/off depending on allowed
+            ctl_outputs_all_off();  // RM2, RM3, RM4 are off
 
 #if !defined(ENABLE_BMS_SIM)
             // Ask PSU to turn OFF (idempotent)

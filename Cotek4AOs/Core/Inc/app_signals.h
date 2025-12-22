@@ -61,6 +61,8 @@ enum AppSignals {
 
     CHARGE_MON_TICK_SIG,      // fast monitor tick (e.g. 20ms) for latch edge detect
     CHARGING_STOPPED_SIG,     // unified stop event
+
+    PSU_ON_WAIT_TO_SIG,       // signal for the PSU
 };
 
 
