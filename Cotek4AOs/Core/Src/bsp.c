@@ -143,7 +143,7 @@ void BSP_die(uint8_t code) {
 }
 
 //--------StartButton-----------------
-bool BSP_isStartPressed(void) {
+bool BSP_isLatchClosed(void) {
     return HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_0) == GPIO_PIN_SET;
 }
 
@@ -330,10 +330,17 @@ void SysTick_Handler(void) { /* HAL tick must always run */
             }
         }
 
-        /* Rising edge on debounced press */
+        /* Latch ON edge (rising) */
         if ((start_db != 0U) && (prev_start_db == 0U)) {
-            static QEvt const ev = QEVT_INITIALIZER(STARTBUTTON_PRESSED_SIG);
-            g_lastSig = STARTBUTTON_PRESSED_SIG; g_lastTag = 31;
+            static QEvt const ev = QEVT_INITIALIZER(LATCH_TURNED_ON_SIG);
+            g_lastSig = LATCH_TURNED_ON_SIG; g_lastTag = 31;
+            QF_PUBLISH(&ev, 0U);
+        }
+
+        /* Latch OFF edge (falling) */
+        if ((start_db == 0U) && (prev_start_db != 0U)) {
+            static QEvt const ev = QEVT_INITIALIZER(LATCH_TURNED_OFF_SIG);
+            g_lastSig = LATCH_TURNED_OFF_SIG; g_lastTag = 33;
             QF_PUBLISH(&ev, 0U);
         }
 
@@ -345,21 +352,6 @@ void SysTick_Handler(void) { /* HAL tick must always run */
 
         prev_start_db = start_db;
         prev_stop_db  = stop_db;
-        if ((tmp & (1U << B1_PIN)) != 0U) {
-            if ((current & (1U << B1_PIN)) != 0U) {
-                static QEvt const pressEvt = QEVT_INITIALIZER(BUTTON_PRESSED_SIG);
-                g_lastSig = BUTTON_PRESSED_SIG;
-                g_lastTag = 1;
-                // tag 1 = SysTick press
-                QACTIVE_POST_X(AO_Controller, &pressEvt, 3U, 0U);
-                printf("BTN: PC13 pressed\r\n"); }
-            else { static QEvt const releaseEvt = QEVT_INITIALIZER(BUTTON_RELEASED_SIG);
-                g_lastSig = BUTTON_RELEASED_SIG;
-                g_lastTag = 2;
-                // tag 2 = SysTick release
-                QACTIVE_POST_X(AO_Controller, &releaseEvt, 3U, 0U);
-            }
-        }
         /* =========================================================
          * Existing PC13 debounced edge detect (unchanged)
          * ========================================================= */

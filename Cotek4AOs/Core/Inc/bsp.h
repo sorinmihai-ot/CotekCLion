@@ -28,7 +28,7 @@ void BSP_delay(uint32_t ms);
 bool BSP_is600s_gpio_high(void);
 
 // ---- Buttons ----
-bool BSP_isStartPressed(void);   // PC0
+bool BSP_isLatchClosed(void);   // PC0
 bool BSP_isStopPressed(void);    // PC1
 
 // ---- Relays (active-low) ----

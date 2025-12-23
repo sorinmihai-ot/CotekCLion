@@ -33,6 +33,12 @@ enum AppSignals {
     STARTBUTTON_PRESSED_SIG,
     STOPBUTTON_PRESSED_SIG,
 
+    LATCH_TURNED_ON_SIG,
+    LATCH_TURNED_OFF_SIG,
+
+    PSU_READY_SIG,         // Cotek -> Controller: PSU coms confirmed
+    PSU_READY_TIMEOUT_SIG,   // Controller: internal sig timeout event for 5s
+
     MAX_PUB_SIG,               // sentinel for QF_psInit only
     /* HMI <-> Controller (direct posts) */
     BOOT_SIG = MAX_PUB_SIG + 1,
@@ -51,6 +57,9 @@ enum AppSignals {
     PSU_REQ_SETPOINT_SIG,      /* Controller -> Cotek                        */
     PSU_REQ_OFF_SIG,           /* Controller -> Cotek                        */
     PSU_RSP_STATUS_SIG,        /* Cotek -> Controller  */
+    PSU_REQ_SYNC_SIG,          // Controller -> Cotek: AC should be on, start boot/presence process
+    PSU_ON_WAIT_TO_SIG,
+
     // ---- Cotek status broadcast (AO_Cotek -> AO_Controller) ----
     COTEK_STATUS_SIG,     // carries PSU presence, out state, and latest readings
     COTEK_TICK_SIG,
@@ -62,9 +71,12 @@ enum AppSignals {
     CHARGE_MON_TICK_SIG,      // fast monitor tick (e.g. 20ms) for latch edge detect
     CHARGING_STOPPED_SIG,     // unified stop event
 
-    PSU_ON_WAIT_TO_SIG,       // signal for the PSU
 };
 
+typedef struct {
+    QEvt super;
+    float vset, iset;
+} PsuSetAckEvt;
 
 /* CAN frame event posted from HAL CAN ISR */
 typedef struct {

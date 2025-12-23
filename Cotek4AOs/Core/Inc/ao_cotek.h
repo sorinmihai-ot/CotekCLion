@@ -11,6 +11,7 @@ extern "C" {
     extern QActive *AO_Cotek;
     void CotekAO_ctor(void);
     uint8_t Cotek_isPresent(void);
+    float Cotek_getVout_V(void);
 
 #ifdef __cplusplus
 }
