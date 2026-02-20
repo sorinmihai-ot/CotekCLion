@@ -50,28 +50,24 @@ void HAL_MspInit(void)
 void HAL_CAN_MspInit(CAN_HandleTypeDef* canHandle)
 {
 
-  if(canHandle->Instance==CAN1)
-  {
-    GPIO_InitTypeDef GPIO_InitStruct = {0};
-    /* Peripheral clock enable */
+  if (canHandle->Instance == CAN1) {
     __HAL_RCC_CAN1_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_AFIO_CLK_ENABLE();
-    __HAL_RCC_GPIOB_CLK_ENABLE();
-    /**CAN GPIO Configuration
-    PB8     ------> CAN_RX
-    PB9     ------> CAN_TX
-    */
-    /* Remap CAN1 to PB8 RX / PB9 TX */
-    __HAL_AFIO_REMAP_CAN1_2();
-    GPIO_InitStruct.Pin = GPIO_PIN_8;
-    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-    GPIO_InitStruct.Pull = GPIO_PULLUP;
-    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-    GPIO_InitStruct.Pin = GPIO_PIN_9;
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    /* PA11 CAN_RX input floating, PA12 CAN_TX AF_PP */
+    GPIO_InitStruct.Pin = GPIO_PIN_11;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    GPIO_InitStruct.Pin = GPIO_PIN_12;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
 
     /* CAN1 interrupt Init */
     HAL_NVIC_SetPriority(USB_HP_CAN1_TX_IRQn, QF_AWARE_ISR_CMSIS_PRI, 0);
@@ -86,6 +82,7 @@ void HAL_CAN_MspInit(CAN_HandleTypeDef* canHandle)
     HAL_NVIC_EnableIRQ(CAN1_RX0_IRQn);
   }
 }
+
 /**
   * @brief CAN MSP De-Initialization
   * This function freeze the hardware resources used in this example
@@ -98,7 +95,7 @@ void HAL_CAN_MspDeInit(CAN_HandleTypeDef* hcan)
   {
     /* Peripheral clock disable */
     __HAL_RCC_CAN1_CLK_DISABLE();
-    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_8|GPIO_PIN_9);
+    HAL_GPIO_DeInit(GPIOA, GPIO_PIN_11|GPIO_PIN_12);
     /* CAN1 interrupt DeInit */
     HAL_NVIC_DisableIRQ(USB_HP_CAN1_TX_IRQn);
     HAL_NVIC_DisableIRQ(USB_LP_CAN1_RX0_IRQn);
@@ -116,22 +113,21 @@ void HAL_I2C_MspInit(I2C_HandleTypeDef* hi2c)
   GPIO_InitTypeDef GPIO_InitStruct = {0};
   if(hi2c->Instance==I2C1)
   {
-    /* USER CODE BEGIN I2C1_MspInit 0 */
-
-    /* USER CODE END I2C1_MspInit 0 */
-
+    __HAL_RCC_AFIO_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
-    /**I2C1 GPIO Configuration
-    PB6     ------> I2C1_SCL
-    PB7     ------> I2C1_SDA
-    */
-    GPIO_InitStruct.Pin = GPIO_PIN_6|GPIO_PIN_7;
+    __HAL_RCC_I2C1_CLK_ENABLE();
+
+    /* Enable I2C1 remap: PB8=SCL, PB9=SDA
+           AFIO->MAPR bit1 = I2C1_REMAP */
+    AFIO->MAPR |= (1u << 1);
+
+    /* PB8 / PB9 as AF Open-Drain (external pull-ups used) */
+    GPIO_InitStruct.Pin = GPIO_PIN_8|GPIO_PIN_9;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-    /* Peripheral clock enable */
-    __HAL_RCC_I2C1_CLK_ENABLE();
     /* I2C1 interrupt Init */
     HAL_NVIC_SetPriority(I2C1_EV_IRQn, QF_AWARE_ISR_CMSIS_PRI, 0);
     HAL_NVIC_EnableIRQ(I2C1_EV_IRQn);
@@ -153,16 +149,17 @@ void HAL_I2C_MspDeInit(I2C_HandleTypeDef* hi2c)
     /* Peripheral clock disable */
     __HAL_RCC_I2C1_CLK_DISABLE();
     /**I2C1 GPIO Configuration
-    PB6     ------> I2C1_SCL
-    PB7     ------> I2C1_SDA
+    PB8     ------> I2C1_SCL
+    PB9     ------> I2C1_SDA
     */
-    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_6);
-    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_7);
+    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_8);
+    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_9);
     /* I2C1 interrupt DeInit */
     HAL_NVIC_DisableIRQ(I2C1_EV_IRQn);
     HAL_NVIC_DisableIRQ(I2C1_ER_IRQn);
   }
 }
+
 
 /**
   * @brief UART MSP Initialization

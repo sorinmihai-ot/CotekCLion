@@ -28,7 +28,7 @@ extern const char *BMS_state_to_text(uint16_t batt_type, uint8_t raw_state);
 #define LOW_CELL_STOP_V  2.80f   // TODO: set per battery family if needed
 #define PACK_GT_PSU_MARGIN_V  1.0f
 #define PACK_PSU_GRACE_MS     3000U
-#define DEFAULT_CHARGE_TIME_S  (30U)
+#define DEFAULT_CHARGE_TIME_S  (120U)
 
 #define PSU_ON_WAIT_MS         20000U   // how long we wait for PSU output ON
 #define PSU_VOUT_OK_MARGIN_V   1.0f    // acceptable difference between setpoint & measured vout
@@ -1273,11 +1273,11 @@ static QState Ctl_charge(ControllerAO * const me, QEvt const * const e) {
                 me->waiting_psu_on);
             return Q_HANDLED();
         }
-        case PSU_ON_WAIT_TO_SIG: {
-            me->waiting_psu_on = 0U;
-            ctl_request_stop(me, CHG_STOP_ELECTRICAL, "PSU Vout did not reach setpoint");
-            return Q_HANDLED();
-        }
+        // case PSU_ON_WAIT_TO_SIG: {
+        //     me->waiting_psu_on = 0U;
+        //     ctl_request_stop(me, CHG_STOP_ELECTRICAL, "PSU Vout did not reach setpoint");
+        //     return Q_HANDLED();
+        // }
         case CHARGE_MON_TICK_SIG: {
             if (++me->ui_div >= 10U) {
                 me->ui_div = 0U;
